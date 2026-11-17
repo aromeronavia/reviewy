@@ -78,7 +78,7 @@ fn run(
         if event::poll(POLL_INTERVAL)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && let Some(action) = keymap::action_for(key)
+            && let Some(action) = keymap::action_for(key, &app.mode)
         {
             for request in app.dispatch(action) {
                 requests.send(request)?;
