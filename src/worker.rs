@@ -47,7 +47,10 @@ mod tests {
 
     use anyhow::bail;
 
-    use crate::github::{ChangedFile, FileStatus, PullRequest};
+    use crate::github::{
+        ChangedFile, ChecksState, Conversation, FileStatus, PullRequest, ReviewDecision,
+        ReviewSubmission,
+    };
 
     struct FakeSource {
         fail: bool,
@@ -64,7 +67,11 @@ mod tests {
                 author: "ann".into(),
                 head_ref: "feat".into(),
                 base_ref: "main".into(),
+                head_sha: "sha".into(),
                 draft: false,
+                review_decision: ReviewDecision::None,
+                checks: ChecksState::None,
+                comment_count: 0,
             }])
         }
 
@@ -76,6 +83,18 @@ mod tests {
                 deletions: 0,
                 patch: None,
             }])
+        }
+
+        fn conversation(&self, _number: u64) -> anyhow::Result<Conversation> {
+            unimplemented!()
+        }
+
+        fn post_comment(&self, _number: u64, _body: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        fn submit_review(&self, _number: u64, _review: &ReviewSubmission) -> anyhow::Result<()> {
+            unimplemented!()
         }
     }
 

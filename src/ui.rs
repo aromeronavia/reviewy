@@ -143,7 +143,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use crate::app::{Action, App, Response};
-    use crate::github::{ChangedFile, FileStatus, PullRequest};
+    use crate::github::{ChangedFile, ChecksState, FileStatus, PullRequest, ReviewDecision};
     use crate::repo::RepoSlug;
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -158,7 +158,11 @@ mod tests {
             author: "ann".into(),
             head_ref: "feat".into(),
             base_ref: "main".into(),
+            head_sha: "sha".into(),
             draft: false,
+            review_decision: ReviewDecision::None,
+            checks: ChecksState::None,
+            comment_count: 0,
         }
     }
 

@@ -276,7 +276,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::diff::DiffLineKind;
-    use crate::github::FileStatus;
+    use crate::github::{ChecksState, FileStatus, ReviewDecision};
 
     fn repo() -> RepoSlug {
         RepoSlug::parse("owner/name").unwrap()
@@ -289,7 +289,11 @@ mod tests {
             author: "ann".into(),
             head_ref: "feat".into(),
             base_ref: "main".into(),
+            head_sha: format!("sha{n}"),
             draft: false,
+            review_decision: ReviewDecision::None,
+            checks: ChecksState::None,
+            comment_count: 0,
         }
     }
 
