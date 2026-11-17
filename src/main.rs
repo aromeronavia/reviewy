@@ -74,7 +74,13 @@ fn run(
     responses: &Receiver<Response>,
 ) -> Result<()> {
     while !app.should_quit {
-        terminal.draw(|frame| ui::render(frame, app))?;
+        let mut viewport = None;
+        terminal.draw(|frame| {
+            viewport = Some(ui::render(frame, app));
+        })?;
+        if let Some(viewport) = viewport {
+            app.set_viewport(viewport);
+        }
         if event::poll(POLL_INTERVAL)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press

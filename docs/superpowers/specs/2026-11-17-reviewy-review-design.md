@@ -106,11 +106,11 @@ request changes, or comment.
 ┌ Pull Requests · owner/name ─┐ Changes │ Conversation
 │ #123 Fix login redirect     │┌ Files (3) ────────────────────────────────┐
 │   ann · feat/login → main   ││ M src/auth.rs                 +12  -3     │
-│   ✓ checks  ○ review  2 💬  ││ A src/theme.rs                +80  -0     │
+│  ✓ ci  ○ review  2 💬      ││ A src/theme.rs                +80  -0     │
 │                             │├ #123 src/auth.rs ─────────────────────────┤
 │ #122 Add dark mode          ││ @@ -10,7 +10,8 @@                         │
 │   bob · dark-mode → main    ││  fn login() {                             │
-│   ✗ checks  ✓ approved      ││-    let x = 1;                            │
+│  ✗ ci  ✓ approved          ││-    let x = 1;                            │
 │                             ││+    let x = 2;                            │
 │                             ││    ann · 2026-11-10: why 2?               │
 │                             ││    (pending) me: because of #99           │
@@ -121,7 +121,7 @@ request changes, or comment.
 
 The sidebar is at least 32 columns. Each card is three lines plus a blank
 separator; the selected card has a highlighted background. Markers: checks
-`✓` green, `✗` red, `●` yellow pending, nothing when there are no checks;
+`✓ ci` green, `✗ ci` red, `● ci` yellow pending, nothing when there are no checks;
 review `✓ approved` green, `✗ changes` red, `○ review` yellow for review
 required, nothing otherwise; `draft` dim; `N 💬` dim when N > 0.
 

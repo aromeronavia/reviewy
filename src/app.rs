@@ -733,7 +733,7 @@ impl App {
         Vec::new()
     }
 
-    fn pr_by_number(&self, number: u64) -> Option<&PullRequest> {
+    pub fn pr_by_number(&self, number: u64) -> Option<&PullRequest> {
         self.prs.iter().find(|pr| pr.number == number)
     }
 
