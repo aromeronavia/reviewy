@@ -56,8 +56,10 @@ fn start(repo_arg: Option<&str>) -> Result<()> {
     };
     let token = auth::resolve_token()?;
     let mut source = HttpGitHub::new(repo.clone(), token)?;
-    if let Ok(base_url) = env::var("GITHUB_API_URL") {
-        source = source.with_base_url(base_url.trim_end_matches('/').to_string());
+    if let Ok(base_url) = env::var("GITHUB_API_URL")
+        && !base_url.trim().is_empty()
+    {
+        source = source.with_base_url(base_url.trim().trim_end_matches('/').to_string());
     }
     let source = Arc::new(source);
     let (requests, responses) = worker::spawn(source);

@@ -214,7 +214,7 @@ fn diff_row(row: &DiffRow) -> Line<'static> {
             text,
             pending,
         } => {
-            let color = if *pending { Color::Yellow } else { Color::Magenta };
+            let color = if pending.is_some() { Color::Yellow } else { Color::Magenta };
             let mut spans = vec![Span::raw(TAB)];
             if let Some(header) = header {
                 spans.push(Span::styled(format!("{header}: "), Style::new().fg(color).bold()));
@@ -318,11 +318,13 @@ fn render_compose_overlay(frame: &mut Frame, app: &App, compose: &Compose) {
     if let ComposeTarget::LineComment { excerpt, .. } = &compose.target {
         lines.push(Line::from(excerpt.replace('\t', TAB)).dark_gray());
     }
-    let typed: Vec<&str> = compose.text.split('\n').collect();
-    let last = typed.len() - 1;
-    for (index, line) in typed.iter().enumerate() {
-        let text = if index == last { format!("{line}▏") } else { line.to_string() };
-        lines.push(Line::from(text));
+    // The cursor is part of the text so it wraps with it and is always on
+    // the last row drawn.
+    let width = text_area.width as usize;
+    for logical in format!("{}▏", compose.text).split('\n') {
+        for piece in hard_wrap(logical, width) {
+            lines.push(Line::from(piece));
+        }
     }
     // Keep the end of the text, where the cursor is, on screen.
     let visible = text_area.height as usize;
@@ -336,6 +338,17 @@ fn render_compose_overlay(frame: &mut Frame, app: &App, compose: &Compose) {
         Paragraph::new(Line::from("Ctrl-s send · Esc cancel · Enter newline").dark_gray()),
         hint_area,
     );
+}
+
+/// Splits one logical line into rows of at most `width` characters, keeping
+/// every character (unlike the conversation wrapper, which drops whitespace).
+fn hard_wrap(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars.chunks(width).map(|chunk| chunk.iter().collect()).collect()
 }
 
 // ---- status bar -------------------------------------------------------------
@@ -402,7 +415,7 @@ fn hints(app: &App) -> &'static str {
         (Mode::PickReviewEvent, _) => " a approve  r request changes  c comment  Esc cancel",
         (Mode::Browse, Focus::PullRequests) => " j/k move  Enter open  v tab  c comment  R review  r reload  q quit",
         (Mode::Browse, Focus::Files) => " j/k move  Enter open file  v conversation  c comment  R review  Esc back  q quit",
-        (Mode::Browse, Focus::Diff) => " j/k move  c comment line  R review  v conversation  Esc back  q quit",
+        (Mode::Browse, Focus::Diff) => " j/k move  c comment  d/D delete pending  R review  v conversation  Esc back  q quit",
         (Mode::Browse, Focus::Conversation) => " j/k scroll  c comment  R review  v changes  Esc back  q quit",
     }
 }
@@ -478,6 +491,7 @@ mod tests {
                 review_state: Some(ReviewState::Approved),
             }],
             threads: vec![],
+            omitted: 0,
         }
     }
 
@@ -730,5 +744,25 @@ mod tests {
         app.dispatch(Action::Cancel);
         app.dispatch(Action::Review);
         let _ = draw(&app, 20, 5);
+    }
+
+    // ---- final review fixes ----
+
+    #[test]
+    fn compose_overlay_wraps_long_lines_so_the_cursor_stays_visible() {
+        let mut app = app_in_diff_on_added_line();
+        app.dispatch(Action::Comment);
+        for _ in 0..150 {
+            app.dispatch(Action::Type('x'));
+        }
+        let text = draw(&app, 100, 30);
+        assert!(text.contains("▏"), "{text}");
+    }
+
+    #[test]
+    fn diff_hints_mention_deleting_pending_comments() {
+        let app = app_in_diff_on_added_line();
+        let text = draw(&app, 120, 30);
+        assert!(text.contains("d/D"), "{text}");
     }
 }

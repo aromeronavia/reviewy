@@ -4,22 +4,20 @@ use crate::app::{Action, Mode};
 use crate::github::ReviewEvent;
 
 /// Translates a key press into an [`Action`] for the current mode. Unbound
-/// keys give `None`. `Ctrl-c` quits from anywhere.
+/// keys give `None`. `Ctrl-c` quits while browsing and cancels a box, so a
+/// reflexive interrupt never discards a draft or the pending comments.
 pub fn action_for(key: KeyEvent, mode: &Mode) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    if ctrl && key.code == KeyCode::Char('c') {
-        return Some(Action::Quit);
-    }
     match mode {
         Mode::Browse => browse_action(key.code, ctrl),
-        Mode::PickReviewEvent => pick_action(key.code),
+        Mode::PickReviewEvent => pick_action(key.code, ctrl),
         Mode::Compose(_) => compose_action(key.code, ctrl),
     }
 }
 
 fn browse_action(code: KeyCode, ctrl: bool) -> Option<Action> {
     let action = match (code, ctrl) {
-        (KeyCode::Char('q'), false) => Action::Quit,
+        (KeyCode::Char('q'), false) | (KeyCode::Char('c'), true) => Action::Quit,
         (KeyCode::Esc, _) => Action::Escape,
         (KeyCode::Tab, _) | (KeyCode::Char('l'), false) => Action::NextPane,
         (KeyCode::BackTab, _) | (KeyCode::Char('h'), false) => Action::PrevPane,
@@ -34,17 +32,19 @@ fn browse_action(code: KeyCode, ctrl: bool) -> Option<Action> {
         (KeyCode::Char('v'), false) => Action::ToggleTab,
         (KeyCode::Char('c'), false) => Action::Comment,
         (KeyCode::Char('R'), false) => Action::Review,
+        (KeyCode::Char('d'), false) => Action::DeleteComment,
+        (KeyCode::Char('D'), false) => Action::DropPending,
         _ => return None,
     };
     Some(action)
 }
 
-fn pick_action(code: KeyCode) -> Option<Action> {
-    let action = match code {
-        KeyCode::Char('a') => Action::Pick(ReviewEvent::Approve),
-        KeyCode::Char('r') => Action::Pick(ReviewEvent::RequestChanges),
-        KeyCode::Char('c') => Action::Pick(ReviewEvent::Comment),
-        KeyCode::Esc => Action::Cancel,
+fn pick_action(code: KeyCode, ctrl: bool) -> Option<Action> {
+    let action = match (code, ctrl) {
+        (KeyCode::Char('a'), false) => Action::Pick(ReviewEvent::Approve),
+        (KeyCode::Char('r'), false) => Action::Pick(ReviewEvent::RequestChanges),
+        (KeyCode::Char('c'), false) => Action::Pick(ReviewEvent::Comment),
+        (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => Action::Cancel,
         _ => return None,
     };
     Some(action)
@@ -52,7 +52,7 @@ fn pick_action(code: KeyCode) -> Option<Action> {
 
 fn compose_action(code: KeyCode, ctrl: bool) -> Option<Action> {
     let action = match (code, ctrl) {
-        (KeyCode::Esc, _) => Action::Cancel,
+        (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => Action::Cancel,
         (KeyCode::Char('s'), true) => Action::Submit,
         (KeyCode::Enter, _) => Action::Newline,
         (KeyCode::Backspace, _) => Action::Backspace,
@@ -123,6 +123,10 @@ mod tests {
         assert_eq!(browse(key(KeyCode::Char('c'))), Some(Action::Comment));
         let shift_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
         assert_eq!(browse(shift_r), Some(Action::Review));
+        assert_eq!(browse(key(KeyCode::Char('d'))), Some(Action::DeleteComment));
+        let shift_d = KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT);
+        assert_eq!(browse(shift_d), Some(Action::DropPending));
+        assert_eq!(browse(ctrl('c')), Some(Action::Quit));
     }
 
     #[test]
@@ -132,7 +136,7 @@ mod tests {
         assert_eq!(action_for(key(KeyCode::Char('r')), &mode), Some(Action::Pick(ReviewEvent::RequestChanges)));
         assert_eq!(action_for(key(KeyCode::Char('c')), &mode), Some(Action::Pick(ReviewEvent::Comment)));
         assert_eq!(action_for(key(KeyCode::Esc), &mode), Some(Action::Cancel));
-        assert_eq!(action_for(ctrl('c'), &mode), Some(Action::Quit));
+        assert_eq!(action_for(ctrl('c'), &mode), Some(Action::Cancel));
         assert_eq!(action_for(key(KeyCode::Char('j')), &mode), None);
     }
 
@@ -148,7 +152,7 @@ mod tests {
         assert_eq!(action_for(key(KeyCode::Char(' ')), &mode), Some(Action::Type(' ')));
         let shift_j = KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT);
         assert_eq!(action_for(shift_j, &mode), Some(Action::Type('J')));
-        assert_eq!(action_for(ctrl('c'), &mode), Some(Action::Quit));
+        assert_eq!(action_for(ctrl('c'), &mode), Some(Action::Cancel));
         assert_eq!(action_for(key(KeyCode::Tab), &mode), None);
     }
 }

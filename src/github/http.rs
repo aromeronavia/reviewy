@@ -37,9 +37,10 @@ const CONVERSATION_QUERY: &str = r#"query($owner: String!, $name: String!, $numb
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       body
-      comments(first: 100) { nodes { author { login } body createdAt } }
-      reviews(first: 100) { nodes { author { login } state body createdAt } }
-      reviewThreads(first: 100) {
+      comments(last: 100) { totalCount nodes { author { login } body createdAt } }
+      reviews(last: 100) { totalCount nodes { author { login } state body createdAt } }
+      reviewThreads(last: 100) {
+        totalCount
         nodes {
           path line diffSide isOutdated isResolved
           comments(first: 50) { nodes { author { login } body createdAt } }
@@ -86,7 +87,7 @@ impl HttpGitHub {
     fn graphql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T> {
         let response = self
             .client
-            .post(format!("{}/graphql", self.base_url))
+            .post(graphql_url(&self.base_url))
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .map_err(network_error)?;
@@ -113,8 +114,7 @@ impl HttpGitHub {
         }
         let detail = response
             .json::<Value>()
-            .ok()
-            .and_then(|body| body["message"].as_str().map(|m| format!(": {m}")))
+            .map(|body| failure_detail(&body))
             .unwrap_or_default();
         bail!("{}{detail}", describe_status(status))
     }
@@ -158,6 +158,30 @@ fn describe_status(status: StatusCode) -> String {
         _ => "",
     };
     format!("GitHub returned {status}{hint}")
+}
+
+/// GitHub's `message` plus its first `errors[]` entry, which is where the
+/// reason for a 422 on a review actually lives.
+fn failure_detail(body: &Value) -> String {
+    let message = body["message"].as_str();
+    let error = body["errors"]
+        .get(0)
+        .and_then(|e| e.as_str().or_else(|| e["message"].as_str()));
+    match (message, error) {
+        (Some(m), Some(e)) => format!(": {m}: {e}"),
+        (Some(m), None) => format!(": {m}"),
+        (None, Some(e)) => format!(": {e}"),
+        (None, None) => String::new(),
+    }
+}
+
+/// GitHub.com serves GraphQL next to REST; GitHub Enterprise Server keeps
+/// REST under `/api/v3` and GraphQL under `/api/graphql`.
+fn graphql_url(base_url: &str) -> String {
+    match base_url.strip_suffix("/api/v3") {
+        Some(host) => format!("{host}/api/graphql"),
+        None => format!("{base_url}/graphql"),
+    }
 }
 
 /// Keeps only the root cause of a transport failure; reqwest's own message
@@ -315,8 +339,18 @@ impl<T> GraphqlResponse<T> {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Nodes<T> {
+    #[serde(default)]
+    total_count: u64,
     nodes: Vec<T>,
+}
+
+impl<T> Nodes<T> {
+    /// How many items the connection holds beyond the ones fetched.
+    fn omitted(&self) -> u64 {
+        self.total_count.saturating_sub(self.nodes.len() as u64)
+    }
 }
 
 #[derive(Deserialize)]
@@ -515,6 +549,7 @@ impl From<WireComment> for Comment {
 /// Merges plain comments and review summaries into one timeline. A review
 /// that only carried line comments has nothing to say here and is skipped.
 fn conversation_from_wire(wire: WireConversation) -> Conversation {
+    let omitted = wire.comments.omitted() + wire.reviews.omitted() + wire.review_threads.omitted();
     let mut comments: Vec<Comment> = wire.comments.nodes.into_iter().map(Comment::from).collect();
     for review in wire.reviews.nodes {
         let state = review_state(&review.state);
@@ -547,6 +582,7 @@ fn conversation_from_wire(wire: WireConversation) -> Conversation {
         body: wire.body.unwrap_or_default(),
         comments,
         threads,
+        omitted,
     }
 }
 
@@ -605,7 +641,7 @@ mod tests {
 
     const LIST_NODE: &str = r#"{"number":5,"title":"T","isDraft":true,"reviewDecision":"APPROVED","author":{"login":"ann"},"headRefName":"feat","baseRefName":"main","headRefOid":"abc123","comments":{"totalCount":2},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}}"#;
     const NULL_NODE: &str = r#"{"number":6,"title":"U","isDraft":false,"reviewDecision":null,"author":null,"headRefName":"f","baseRefName":"m","headRefOid":"def","comments":{"totalCount":0},"commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}"#;
-    const CONVERSATION: &str = r#"{"body":"Hello","comments":{"nodes":[{"author":{"login":"bob"},"body":"second","createdAt":"2026-01-03T00:00:00Z"}]},"reviews":{"nodes":[{"author":{"login":"ann"},"state":"APPROVED","body":"lgtm","createdAt":"2026-01-02T00:00:00Z"},{"author":{"login":"cat"},"state":"COMMENTED","body":"","createdAt":"2026-01-01T00:00:00Z"}]},"reviewThreads":{"nodes":[{"path":"src/a.rs","line":7,"diffSide":"LEFT","isOutdated":false,"isResolved":false,"comments":{"nodes":[{"author":{"login":"ann"},"body":"why?","createdAt":"2026-01-02T00:00:00Z"}]}}]}}"#;
+    const CONVERSATION: &str = r#"{"body":"Hello","comments":{"totalCount":150,"nodes":[{"author":{"login":"bob"},"body":"second","createdAt":"2026-01-03T00:00:00Z"}]},"reviews":{"totalCount":2,"nodes":[{"author":{"login":"ann"},"state":"APPROVED","body":"lgtm","createdAt":"2026-01-02T00:00:00Z"},{"author":{"login":"cat"},"state":"COMMENTED","body":"","createdAt":"2026-01-01T00:00:00Z"}]},"reviewThreads":{"totalCount":1,"nodes":[{"path":"src/a.rs","line":7,"diffSide":"LEFT","isOutdated":false,"isResolved":false,"comments":{"nodes":[{"author":{"login":"ann"},"body":"why?","createdAt":"2026-01-02T00:00:00Z"}]}}]}}"#;
 
     #[test]
     fn maps_list_node_to_pull_request() {
@@ -762,6 +798,14 @@ mod tests {
 
     /// Accepts one HTTP request, answers 201, and hands the raw request back.
     fn stub_server() -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        stub_server_with("201 Created", "{}")
+    }
+
+    /// Accepts one HTTP request, answers with the given status and body.
+    fn stub_server_with(
+        status: &'static str,
+        body: &'static str,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -788,11 +832,54 @@ mod tests {
                     }
                 }
             }
-            stream
-                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                .unwrap();
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
             tx.send(String::from_utf8_lossy(&buf).into_owned()).unwrap();
         });
         (addr, rx)
+    }
+
+    // ---- final review fixes ----
+
+    #[test]
+    fn conversation_counts_omitted_items() {
+        let wire: WireConversation = serde_json::from_str(CONVERSATION).unwrap();
+        let conversation = conversation_from_wire(wire);
+        assert_eq!(conversation.omitted, 149);
+    }
+
+    #[test]
+    fn graphql_url_handles_enterprise_rest_base() {
+        assert_eq!(graphql_url("https://api.github.com"), "https://api.github.com/graphql");
+        assert_eq!(
+            graphql_url("https://ghe.example.com/api/v3"),
+            "https://ghe.example.com/api/graphql"
+        );
+    }
+
+    #[test]
+    fn failure_detail_includes_first_error() {
+        let body = json!({"message": "Unprocessable Entity", "errors": ["line must be part of the diff"]});
+        assert_eq!(failure_detail(&body), ": Unprocessable Entity: line must be part of the diff");
+        let body = json!({"message": "Validation Failed", "errors": [{"message": "Body is too long"}]});
+        assert_eq!(failure_detail(&body), ": Validation Failed: Body is too long");
+        assert_eq!(failure_detail(&json!({})), "");
+    }
+
+    #[test]
+    fn post_failure_reports_github_errors() {
+        let (addr, _received) = stub_server_with(
+            "422 Unprocessable Entity",
+            r#"{"message":"Unprocessable Entity","errors":["line must be part of the diff"]}"#,
+        );
+        let client = HttpGitHub::new(RepoSlug::parse("o/n").unwrap(), "t".into())
+            .unwrap()
+            .with_base_url(format!("http://{addr}"));
+        let err = format!("{:#}", client.post_comment(5, "hi").unwrap_err());
+        assert!(err.contains("422"), "{err}");
+        assert!(err.contains("line must be part of the diff"), "{err}");
     }
 }

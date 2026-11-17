@@ -89,6 +89,8 @@ pub struct Conversation {
     pub body: String,
     pub comments: Vec<Comment>,
     pub threads: Vec<Thread>,
+    /// Older comments, reviews, and threads that were not fetched.
+    pub omitted: u64,
 }
 
 /// A line comment the user wrote locally, waiting to go with a review.

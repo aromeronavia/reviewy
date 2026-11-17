@@ -96,6 +96,8 @@ pub enum Action {
     ToggleTab,
     Comment,
     Review,
+    DeleteComment,
+    DropPending,
     Pick(ReviewEvent),
     Type(char),
     Newline,
@@ -182,7 +184,8 @@ pub enum DiffRow {
         /// `author · date` (or `pending`) on a comment's first row only.
         header: Option<String>,
         text: String,
-        pending: bool,
+        /// For a pending comment, its index in `App::pending_comments`.
+        pending: Option<usize>,
     },
 }
 
@@ -221,6 +224,8 @@ pub struct App {
     pub file_index: usize,
     /// The PR whose files are currently shown.
     pub loaded_pr: Option<u64>,
+    /// The head commit the files were requested under; reviews pin to it.
+    pub loaded_sha: Option<String>,
     pub conversation: Option<Conversation>,
     pub conversation_for: Option<u64>,
     pub conversation_scroll: usize,
@@ -232,6 +237,8 @@ pub struct App {
     pub pending_pr: Option<u64>,
     pub in_flight: Vec<InFlight>,
     pub notice: Option<Notice>,
+    /// The last text sent to GitHub, restored into the box if the send fails.
+    pub draft: Option<Compose>,
     pub viewport: Viewport,
     pub should_quit: bool,
 }
@@ -272,6 +279,7 @@ impl App {
             files: Vec::new(),
             file_index: 0,
             loaded_pr: None,
+            loaded_sha: None,
             conversation: None,
             conversation_for: None,
             conversation_scroll: 0,
@@ -282,6 +290,7 @@ impl App {
             pending_pr: None,
             in_flight: Vec::new(),
             notice: None,
+            draft: None,
             viewport: Viewport::default(),
             should_quit: false,
         }
@@ -293,11 +302,6 @@ impl App {
 
     pub fn selected_file(&self) -> Option<&ChangedFile> {
         self.files.get(self.file_index)
-    }
-
-    /// The PR the user opened, if it is still in the list.
-    pub fn opened_pr(&self) -> Option<&PullRequest> {
-        self.opened.and_then(|number| self.pr_by_number(number))
     }
 
     pub fn is_loading(&self, what: InFlight) -> bool {
@@ -366,6 +370,7 @@ impl App {
                         self.pr_index = previous
                             .and_then(|number| self.prs.iter().position(|pr| pr.number == number))
                             .unwrap_or(0);
+                        return self.reload_if_head_moved();
                     }
                     Err(message) => self.fail(message),
                 }
@@ -406,6 +411,7 @@ impl App {
                 self.settle(InFlight::Comment(number));
                 match result {
                     Ok(()) => {
+                        self.draft = None;
                         self.hint(&format!("Comment posted on #{number}"));
                         if self.opened == Some(number)
                             && !self.is_loading(InFlight::Conversation(number))
@@ -413,13 +419,14 @@ impl App {
                             return vec![self.track(Request::LoadConversation { number })];
                         }
                     }
-                    Err(message) => self.fail(message),
+                    Err(message) => self.fail_and_restore_draft(message),
                 }
             }
             Response::ReviewSubmitted { number, result } => {
                 self.settle(InFlight::Review(number));
                 match result {
                     Ok(()) => {
+                        self.draft = None;
                         if self.pending_pr == Some(number) {
                             self.pending_comments.clear();
                             self.pending_pr = None;
@@ -437,11 +444,55 @@ impl App {
                         }
                         return follow_ups;
                     }
-                    Err(message) => self.fail(message),
+                    Err(message) => self.fail_and_restore_draft(message),
                 }
             }
         }
         Vec::new()
+    }
+
+    /// After a list refresh, if the opened PR's head moved past the commit
+    /// the diff was loaded under, drop that diff and load the new one.
+    fn reload_if_head_moved(&mut self) -> Vec<Request> {
+        let Some(number) = self.opened else {
+            return Vec::new();
+        };
+        if self.loaded_pr != Some(number) {
+            return Vec::new();
+        }
+        let Some(head_sha) = self.pr_by_number(number).map(|pr| pr.head_sha.clone()) else {
+            return Vec::new();
+        };
+        if self.loaded_sha.as_deref() == Some(head_sha.as_str()) {
+            return Vec::new();
+        }
+        self.forget_loaded_pr();
+        self.loaded_sha = Some(head_sha);
+        let stale = if self.pending_pr == Some(number) && !self.pending_comments.is_empty() {
+            "; pending comments may be stale"
+        } else {
+            ""
+        };
+        self.hint(&format!("#{number} has new commits; reloading{stale}"));
+        vec![
+            self.track(Request::LoadFiles { number }),
+            self.track(Request::LoadConversation { number }),
+        ]
+    }
+
+    /// Clears everything shown for the previously opened PR so nothing stale
+    /// can be read, commented on, or sent.
+    fn forget_loaded_pr(&mut self) {
+        self.files.clear();
+        self.file_index = 0;
+        self.diff_rows.clear();
+        self.diff_cursor = 0;
+        self.diff_offset = 0;
+        self.loaded_pr = None;
+        self.loaded_sha = None;
+        self.conversation = None;
+        self.conversation_for = None;
+        self.conversation_scroll = 0;
     }
 
     // ---- browse-mode actions ------------------------------------------------
@@ -463,6 +514,8 @@ impl App {
             Action::ToggleTab => self.toggle_tab(),
             Action::Comment => self.start_comment(),
             Action::Review => self.start_review(),
+            Action::DeleteComment => self.delete_comment(),
+            Action::DropPending => self.drop_pending(),
             Action::Pick(_)
             | Action::Type(_)
             | Action::Newline
@@ -507,11 +560,44 @@ impl App {
     }
 
     fn start_review(&mut self) {
-        if self.opened.is_some() {
-            self.mode = Mode::PickReviewEvent;
-        } else {
-            self.hint("Open a pull request first");
+        match self.opened {
+            None => self.hint("Open a pull request first"),
+            Some(number) if self.is_loading(InFlight::Review(number)) => {
+                self.hint("Review submission in progress");
+            }
+            Some(_) => self.mode = Mode::PickReviewEvent,
         }
+    }
+
+    fn delete_comment(&mut self) {
+        let index = match self.diff_rows.get(self.diff_cursor) {
+            Some(DiffRow::Comment { pending: Some(index), .. }) if self.focus == Focus::Diff => {
+                *index
+            }
+            _ => {
+                self.hint("Move to a pending comment first");
+                return;
+            }
+        };
+        self.pending_comments.remove(index);
+        if self.pending_comments.is_empty() {
+            self.pending_pr = None;
+        }
+        self.rebuild_diff_rows();
+        self.hint(&format!("Pending comments: {}", self.pending_comments.len()));
+    }
+
+    fn drop_pending(&mut self) {
+        let count = self.pending_comments.len();
+        if count == 0 {
+            self.hint("No pending comments");
+            return;
+        }
+        self.pending_comments.clear();
+        self.pending_pr = None;
+        self.rebuild_diff_rows();
+        let plural = if count == 1 { "" } else { "s" };
+        self.hint(&format!("Dropped {count} pending comment{plural}"));
     }
 
     // ---- pick and compose modes ---------------------------------------------
@@ -561,7 +647,7 @@ impl App {
                 if body.is_empty() {
                     return self.refuse("Comment is empty");
                 }
-                self.mode = Mode::Browse;
+                self.draft = self.take_compose();
                 vec![self.track(Request::PostComment { number, body })]
             }
             ComposeTarget::LineComment { path, line, side, .. } => {
@@ -576,6 +662,9 @@ impl App {
                 Vec::new()
             }
             ComposeTarget::Review { event } => {
+                if self.is_loading(InFlight::Review(number)) {
+                    return self.refuse("Review submission in progress");
+                }
                 let comments = if self.pending_pr == Some(number) {
                     self.pending_comments.clone()
                 } else {
@@ -590,11 +679,8 @@ impl App {
                     }
                     _ => {}
                 }
-                let commit_sha = self
-                    .opened_pr()
-                    .map(|pr| pr.head_sha.clone())
-                    .unwrap_or_default();
-                self.mode = Mode::Browse;
+                let commit_sha = self.loaded_sha.clone().unwrap_or_default();
+                self.draft = self.take_compose();
                 let review = ReviewSubmission { event, body, commit_sha, comments };
                 vec![self.track(Request::SubmitReview { number, review })]
             }
@@ -628,6 +714,12 @@ impl App {
                 let Some(number) = self.selected_pr().map(|pr| pr.number) else {
                     return Vec::new();
                 };
+                let head_sha = self.selected_pr().map(|pr| pr.head_sha.clone());
+                if self.opened != Some(number) {
+                    // Nothing from the previous PR may stay readable or
+                    // commentable while the new one loads.
+                    self.forget_loaded_pr();
+                }
                 self.opened = Some(number);
                 self.focus = self.tab.first_pane();
                 // Loads for other PRs would be dropped on arrival; stop
@@ -638,6 +730,7 @@ impl App {
                 });
                 let mut requests = Vec::new();
                 if self.loaded_pr != Some(number) && !self.is_loading(InFlight::Files(number)) {
+                    self.loaded_sha = head_sha;
                     requests.push(self.track(Request::LoadFiles { number }));
                 }
                 if self.conversation_for != Some(number)
@@ -718,6 +811,25 @@ impl App {
         });
     }
 
+    /// Leaves the compose box, handing back what was in it.
+    fn take_compose(&mut self) -> Option<Compose> {
+        match std::mem::replace(&mut self.mode, Mode::Browse) {
+            Mode::Compose(compose) => Some(compose),
+            _ => None,
+        }
+    }
+
+    /// A send failed: show why and put the text back in front of the user,
+    /// unless they have already started another box.
+    fn fail_and_restore_draft(&mut self, message: String) {
+        self.fail(message);
+        if let Some(draft) = self.draft.take()
+            && self.mode == Mode::Browse
+        {
+            self.mode = Mode::Compose(draft);
+        }
+    }
+
     fn hint(&mut self, text: &str) {
         self.notice = Some(Notice {
             text: text.to_string(),
@@ -745,6 +857,9 @@ impl App {
     /// The line number, side, and text of the patch line under the cursor,
     /// when a comment can be attached to it.
     pub fn commentable_at_cursor(&self) -> Option<(u64, DiffSide, String)> {
+        if self.loaded_pr.is_none() || self.loaded_pr != self.opened {
+            return None;
+        }
         self.selected_file()?;
         match self.diff_rows.get(self.diff_cursor)? {
             DiffRow::Line(line) => {
@@ -764,13 +879,15 @@ impl App {
             let threads: Vec<_> = self
                 .conversation
                 .iter()
+                .filter(|_| self.conversation_for == self.opened)
                 .flat_map(|conversation| conversation.threads.iter())
                 .filter(|thread| !thread.outdated && thread.path == path)
                 .collect();
-            let pending: Vec<_> = self
+            let pending: Vec<(usize, &NewLineComment)> = self
                 .pending_comments
                 .iter()
-                .filter(|comment| self.pending_pr == self.opened && comment.path == path)
+                .enumerate()
+                .filter(|(_, comment)| self.pending_pr == self.opened && comment.path == path)
                 .collect();
             for line in file.patch.as_deref().map(parse_patch).unwrap_or_default() {
                 let anchor = anchor_of(&line);
@@ -784,14 +901,14 @@ impl App {
                 {
                     for comment in &thread.comments {
                         let header = format!("{} · {}", comment.author, short_date(&comment.created_at));
-                        push_comment_rows(&mut rows, header, &comment.body, false, width);
+                        push_comment_rows(&mut rows, header, &comment.body, None, width);
                     }
                 }
-                for comment in pending
+                for (index, comment) in pending
                     .iter()
-                    .filter(|comment| comment.line == number && comment.side == side)
+                    .filter(|(_, comment)| comment.line == number && comment.side == side)
                 {
-                    push_comment_rows(&mut rows, "pending".into(), &comment.body, true, width);
+                    push_comment_rows(&mut rows, "pending".into(), &comment.body, Some(*index), width);
                 }
             }
         }
@@ -826,7 +943,13 @@ fn anchor_of(line: &DiffLine) -> Option<(u64, DiffSide)> {
     }
 }
 
-fn push_comment_rows(rows: &mut Vec<DiffRow>, header: String, body: &str, pending: bool, width: usize) {
+fn push_comment_rows(
+    rows: &mut Vec<DiffRow>,
+    header: String,
+    body: &str,
+    pending: Option<usize>,
+    width: usize,
+) {
     let mut header = Some(header);
     for text in wrap(body, width) {
         rows.push(DiffRow::Comment {
@@ -904,6 +1027,12 @@ pub fn conversation_rows(
     }
     rows.push(blank());
     rows.push(row(format!("Comments ({})", conversation.comments.len()), ConvRowKind::Heading));
+    if conversation.omitted > 0 {
+        rows.push(row(
+            format!("{} older items not shown", conversation.omitted),
+            ConvRowKind::Meta,
+        ));
+    }
     for comment in &conversation.comments {
         let mut header = format!("{} · {}", comment.author, short_date(&comment.created_at));
         if let Some(state) = comment.review_state {
@@ -1192,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_loaded_pr_drops_other_pending_loads() {
+    fn reopening_a_pr_drops_other_pending_loads_and_reloads_it() {
         let mut app = loaded_app();
         app.dispatch(Action::PrevPane);
         app.dispatch(Action::Up);
@@ -1202,10 +1331,17 @@ mod tests {
         );
         app.dispatch(Action::PrevPane);
         app.dispatch(Action::Down);
-        assert_eq!(app.dispatch(Action::Open), vec![]);
+        // #2's diff was cleared when #1 was opened, so it is requested again.
+        assert_eq!(
+            app.dispatch(Action::Open),
+            vec![Request::LoadFiles { number: 2 }, Request::LoadConversation { number: 2 }]
+        );
         assert_eq!(app.opened, Some(2));
         assert!(!app.is_loading(InFlight::Files(1)));
         app.apply(Response::Files { number: 1, result: Ok(vec![file("other.rs", Some("+o"))]) });
+        assert_eq!(app.loaded_pr, None);
+        assert!(app.files.is_empty());
+        app.apply(Response::Files { number: 2, result: Ok(two_files()) });
         assert_eq!(app.loaded_pr, Some(2));
         assert_eq!(app.files, two_files());
     }
@@ -1430,6 +1566,7 @@ mod tests {
                 comment("bob", "2026-01-03", "second", None),
             ],
             threads: vec![],
+            omitted: 0,
         };
         let rows = conversation_rows(2, Some(&pr(2)), &conversation, 80);
         let authors: Vec<&str> = rows
@@ -1451,6 +1588,7 @@ mod tests {
                 thread("src/b.rs", None, DiffSide::Right, false),
                 thread("src/c.rs", Some(3), DiffSide::Right, false),
             ],
+            omitted: 0,
         };
         let rows = conversation_rows(2, None, &conversation, 80);
         let threads: Vec<&str> = rows
@@ -1481,7 +1619,7 @@ mod tests {
 
     fn comment_row(row: &DiffRow) -> (Option<&str>, &str, bool) {
         match row {
-            DiffRow::Comment { header, text, pending } => (header.as_deref(), text.as_str(), *pending),
+            DiffRow::Comment { header, text, pending } => (header.as_deref(), text.as_str(), pending.is_some()),
             other => panic!("expected a comment row, got {other:?}"),
         }
     }
@@ -1790,7 +1928,7 @@ mod tests {
         assert_eq!(follow_ups, vec![Request::LoadConversation { number: 2 }, Request::LoadPullRequests]);
         assert!(app.pending_comments.is_empty());
         assert_eq!(app.pending_pr, None);
-        assert!(!app.diff_rows.iter().any(|r| matches!(r, DiffRow::Comment { pending: true, .. })));
+        assert!(!app.diff_rows.iter().any(|r| matches!(r, DiffRow::Comment { pending: Some(_), .. })));
         assert!(app.notice.as_ref().is_some_and(|n| n.text.contains("submitted") && !n.error));
     }
 
@@ -1855,5 +1993,159 @@ mod tests {
         app.dispatch(Action::Comment);
         app.dispatch(Action::Quit);
         assert!(app.should_quit);
+    }
+
+    // ---- final review fixes ----
+
+    #[test]
+    fn switching_pr_clears_stale_diff_and_refuses_comments() {
+        let mut app = loaded_app();
+        app.dispatch(Action::PrevPane);
+        app.dispatch(Action::Up);
+        app.dispatch(Action::Open);
+        assert!(app.files.is_empty());
+        assert!(app.diff_rows.is_empty());
+        assert_eq!(app.loaded_pr, None);
+        assert_eq!(app.conversation, None);
+        assert_eq!(app.conversation_for, None);
+        app.apply(Response::Files { number: 1, result: Err("403".into()) });
+        app.dispatch(Action::NextPane);
+        assert_eq!(app.focus, Focus::Diff);
+        assert_eq!(app.commentable_at_cursor(), None);
+        app.dispatch(Action::Comment);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.pending_comments.is_empty());
+    }
+
+    #[test]
+    fn delete_removes_pending_comment_under_cursor() {
+        let mut app = diff_focused_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "mine");
+        app.dispatch(Action::Submit);
+        app.dispatch(Action::Down);
+        assert!(matches!(app.diff_rows[app.diff_cursor], DiffRow::Comment { pending: Some(0), .. }));
+        app.dispatch(Action::DeleteComment);
+        assert!(app.pending_comments.is_empty());
+        assert_eq!(app.pending_pr, None);
+        assert!(!app.diff_rows.iter().any(|r| matches!(r, DiffRow::Comment { .. })));
+        assert_eq!(app.notice, Some(Notice { text: "Pending comments: 0".into(), error: false }));
+    }
+
+    #[test]
+    fn delete_on_a_patch_line_is_refused() {
+        let mut app = diff_focused_app();
+        app.dispatch(Action::DeleteComment);
+        assert_eq!(app.notice.as_ref().map(|n| n.text.as_str()), Some("Move to a pending comment first"));
+    }
+
+    #[test]
+    fn drop_pending_clears_all() {
+        let mut app = diff_focused_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "mine");
+        app.dispatch(Action::Submit);
+        app.dispatch(Action::DropPending);
+        assert!(app.pending_comments.is_empty());
+        assert_eq!(app.pending_pr, None);
+        assert_eq!(app.notice, Some(Notice { text: "Dropped 1 pending comment".into(), error: false }));
+        app.dispatch(Action::DropPending);
+        assert_eq!(app.notice.as_ref().map(|n| n.text.as_str()), Some("No pending comments"));
+    }
+
+    #[test]
+    fn review_while_submitting_is_refused() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Review);
+        app.dispatch(Action::Pick(ReviewEvent::Approve));
+        assert_eq!(app.dispatch(Action::Submit).len(), 1);
+        assert!(app.is_loading(InFlight::Review(2)));
+        app.dispatch(Action::Review);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.notice.as_ref().map(|n| n.text.as_str()), Some("Review submission in progress"));
+    }
+
+    #[test]
+    fn failed_post_restores_draft() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "hello");
+        app.dispatch(Action::Submit);
+        assert_eq!(app.mode, Mode::Browse);
+        app.apply(Response::CommentPosted { number: 2, result: Err("boom".into()) });
+        assert_eq!(compose_text(&app), "hello");
+        assert_eq!(app.notice, Some(Notice { text: "boom".into(), error: true }));
+    }
+
+    #[test]
+    fn failed_review_restores_draft_body() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Review);
+        app.dispatch(Action::Pick(ReviewEvent::RequestChanges));
+        type_text(&mut app, "please fix");
+        app.dispatch(Action::Submit);
+        app.apply(Response::ReviewSubmitted { number: 2, result: Err("422".into()) });
+        assert!(matches!(
+            &app.mode,
+            Mode::Compose(c) if c.text == "please fix"
+                && c.target == ComposeTarget::Review { event: ReviewEvent::RequestChanges }
+        ));
+    }
+
+    #[test]
+    fn successful_post_clears_draft() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "hello");
+        app.dispatch(Action::Submit);
+        app.apply(Response::CommentPosted { number: 2, result: Ok(()) });
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.draft, None);
+    }
+
+    #[test]
+    fn review_uses_the_sha_the_diff_was_loaded_with() {
+        let mut app = loaded_app();
+        assert_eq!(app.loaded_sha.as_deref(), Some("sha2"));
+        app.dispatch(Action::Review);
+        app.dispatch(Action::Pick(ReviewEvent::Approve));
+        match app.dispatch(Action::Submit).as_slice() {
+            [Request::SubmitReview { review, .. }] => assert_eq!(review.commit_sha, "sha2"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_with_new_head_reloads_opened_pr() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Refresh);
+        let mut newer = pr(2);
+        newer.head_sha = "sha2b".into();
+        let follow_ups = app.apply(Response::PullRequests(Ok(vec![pr(1), newer])));
+        assert_eq!(
+            follow_ups,
+            vec![Request::LoadFiles { number: 2 }, Request::LoadConversation { number: 2 }]
+        );
+        assert_eq!(app.loaded_sha.as_deref(), Some("sha2b"));
+        assert!(app.files.is_empty());
+        assert_eq!(app.loaded_pr, None);
+        assert!(app.notice.as_ref().is_some_and(|n| n.text.contains("new commits")), "{:?}", app.notice);
+    }
+
+    #[test]
+    fn refresh_with_same_head_keeps_loaded_diff() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Refresh);
+        let follow_ups = app.apply(Response::PullRequests(Ok(vec![pr(1), pr(2)])));
+        assert_eq!(follow_ups, vec![]);
+        assert_eq!(app.files.len(), 2);
+        assert_eq!(app.loaded_pr, Some(2));
+    }
+
+    #[test]
+    fn rows_mention_omitted_older_items() {
+        let conversation = Conversation { omitted: 149, ..Conversation::default() };
+        let rows = conversation_rows(2, None, &conversation, 80);
+        assert!(rows.iter().any(|r| r.text == "149 older items not shown"), "{rows:?}");
     }
 }
