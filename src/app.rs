@@ -2,7 +2,7 @@
 //! terminal types: the keymap turns keys into [`Action`]s, the worker turns
 //! [`Request`]s into [`Response`]s, and the UI draws whatever is here.
 
-use crate::diff::{DiffLine, parse_patch};
+use crate::diff::{DiffLine, DiffLineKind, parse_patch};
 use crate::github::{
     ChangedFile, Conversation, DiffSide, NewLineComment, PullRequest, ReviewEvent, ReviewState,
     ReviewSubmission,
@@ -173,10 +173,17 @@ impl Default for Viewport {
     }
 }
 
-/// One row of the diff pane.
+/// One row of the diff pane: a patch line, or one wrapped line of a
+/// comment shown under the patch line it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffRow {
     Line(DiffLine),
+    Comment {
+        /// `author · date` (or `pending`) on a comment's first row only.
+        header: Option<String>,
+        text: String,
+        pending: bool,
+    },
 }
 
 /// One pre-wrapped row of the conversation pane.
@@ -555,15 +562,60 @@ impl App {
             .saturating_sub(self.viewport.conversation_height)
     }
 
+    /// The line number, side, and text of the patch line under the cursor,
+    /// when a comment can be attached to it.
+    pub fn commentable_at_cursor(&self) -> Option<(u64, DiffSide, String)> {
+        self.selected_file()?;
+        match self.diff_rows.get(self.diff_cursor)? {
+            DiffRow::Line(line) => {
+                anchor_of(line).map(|(number, side)| (number, side, line.text.clone()))
+            }
+            DiffRow::Comment { .. } => None,
+        }
+    }
+
+    /// Lays the selected file out as rows: each patch line, then the review
+    /// threads anchored to it, then the pending comments on it.
     fn rebuild_diff_rows(&mut self) {
-        self.diff_rows = self
-            .selected_file()
-            .and_then(|file| file.patch.as_deref())
-            .map(parse_patch)
-            .unwrap_or_default()
-            .into_iter()
-            .map(DiffRow::Line)
-            .collect();
+        let width = self.viewport.diff_width.saturating_sub(6).max(10);
+        let mut rows = Vec::new();
+        if let Some(file) = self.selected_file() {
+            let path = file.filename.as_str();
+            let threads: Vec<_> = self
+                .conversation
+                .iter()
+                .flat_map(|conversation| conversation.threads.iter())
+                .filter(|thread| !thread.outdated && thread.path == path)
+                .collect();
+            let pending: Vec<_> = self
+                .pending_comments
+                .iter()
+                .filter(|comment| comment.path == path)
+                .collect();
+            for line in file.patch.as_deref().map(parse_patch).unwrap_or_default() {
+                let anchor = anchor_of(&line);
+                rows.push(DiffRow::Line(line));
+                let Some((number, side)) = anchor else {
+                    continue;
+                };
+                for thread in threads
+                    .iter()
+                    .filter(|thread| thread.line == Some(number) && thread.side == side)
+                {
+                    for comment in &thread.comments {
+                        let header = format!("{} · {}", comment.author, short_date(&comment.created_at));
+                        push_comment_rows(&mut rows, header, &comment.body, false, width);
+                    }
+                }
+                for comment in pending
+                    .iter()
+                    .filter(|comment| comment.line == number && comment.side == side)
+                {
+                    push_comment_rows(&mut rows, "pending".into(), &comment.body, true, width);
+                }
+            }
+        }
+        self.diff_rows = rows;
         self.diff_cursor = self.diff_cursor.min(self.diff_rows.len().saturating_sub(1));
         self.follow_cursor();
     }
@@ -579,6 +631,29 @@ impl App {
         }
         let max_offset = self.diff_rows.len().saturating_sub(height);
         self.diff_offset = self.diff_offset.min(max_offset);
+    }
+}
+
+/// Where a comment on this patch line would attach: added and context lines
+/// belong to the new file, removed lines to the old one.
+fn anchor_of(line: &DiffLine) -> Option<(u64, DiffSide)> {
+    match line.kind {
+        DiffLineKind::Added | DiffLineKind::Context => {
+            line.new_line.map(|number| (number, DiffSide::Right))
+        }
+        DiffLineKind::Removed => line.old_line.map(|number| (number, DiffSide::Left)),
+        DiffLineKind::Hunk => None,
+    }
+}
+
+fn push_comment_rows(rows: &mut Vec<DiffRow>, header: String, body: &str, pending: bool, width: usize) {
+    let mut header = Some(header);
+    for text in wrap(body, width) {
+        rows.push(DiffRow::Comment {
+            header: header.take(),
+            text,
+            pending,
+        });
     }
 }
 
@@ -1212,5 +1287,96 @@ mod tests {
         let conversation = Conversation { body: "x".repeat(50), ..Conversation::default() };
         let rows = conversation_rows(2, None, &conversation, 20);
         assert!(rows.iter().filter(|r| r.kind == ConvRowKind::Body).all(|r| r.text.len() <= 20));
+    }
+
+    // ---- diff rows with comments (Task 5) ----
+
+    fn app_with_threads(threads: Vec<Thread>) -> App {
+        let mut app = app_with_pr2_opened();
+        app.apply(Response::Files { number: 2, result: Ok(two_files()) });
+        let conversation = Conversation { threads, ..Conversation::default() };
+        app.apply(Response::Conversation { number: 2, result: Ok(conversation) });
+        app
+    }
+
+    fn comment_row(row: &DiffRow) -> (Option<&str>, &str, bool) {
+        match row {
+            DiffRow::Comment { header, text, pending } => (header.as_deref(), text.as_str(), *pending),
+            other => panic!("expected a comment row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn threads_appear_under_their_line() {
+        let app = app_with_threads(vec![thread("a.rs", Some(21), DiffSide::Right, false)]);
+        assert_eq!(app.diff_rows.len(), 5);
+        assert_eq!(line_row(&app.diff_rows[3]).text, "+c");
+        assert_eq!(comment_row(&app.diff_rows[4]), (Some("ann · 2026-01-02"), "why?", false));
+    }
+
+    #[test]
+    fn left_side_threads_match_old_line_numbers() {
+        let app = app_with_threads(vec![thread("a.rs", Some(11), DiffSide::Left, false)]);
+        assert_eq!(line_row(&app.diff_rows[2]).text, "-b");
+        assert_eq!(comment_row(&app.diff_rows[3]).1, "why?");
+        assert_eq!(line_row(&app.diff_rows[4]).text, "+c");
+    }
+
+    #[test]
+    fn outdated_and_other_file_threads_are_skipped() {
+        let app = app_with_threads(vec![
+            thread("a.rs", Some(21), DiffSide::Right, true),
+            thread("b.rs", Some(21), DiffSide::Right, false),
+            thread("a.rs", Some(21), DiffSide::Left, false),
+        ]);
+        assert_eq!(app.diff_rows.len(), 4);
+    }
+
+    #[test]
+    fn pending_comments_follow_existing_threads() {
+        let mut app = app_with_threads(vec![thread("a.rs", Some(21), DiffSide::Right, false)]);
+        app.pending_comments.push(NewLineComment {
+            path: "a.rs".into(),
+            line: 21,
+            side: DiffSide::Right,
+            body: "mine".into(),
+        });
+        app.rebuild_diff_rows();
+        assert_eq!(app.diff_rows.len(), 6);
+        assert_eq!(comment_row(&app.diff_rows[4]).0, Some("ann · 2026-01-02"));
+        assert_eq!(comment_row(&app.diff_rows[5]), (Some("pending"), "mine", true));
+    }
+
+    #[test]
+    fn long_comment_bodies_wrap_into_rows() {
+        let mut thread = thread("a.rs", Some(21), DiffSide::Right, false);
+        thread.comments[0].body = "word ".repeat(12).trim().to_string();
+        let mut app = app_with_threads(vec![thread]);
+        app.set_viewport(Viewport { diff_width: 30, ..Viewport::default() });
+        let comment_rows: Vec<&DiffRow> = app
+            .diff_rows
+            .iter()
+            .filter(|row| matches!(row, DiffRow::Comment { .. }))
+            .collect();
+        assert!(comment_rows.len() >= 3, "{comment_rows:?}");
+        assert!(comment_row(comment_rows[0]).0.is_some());
+        assert!(comment_rows[1..].iter().all(|row| comment_row(row).0.is_none()));
+        assert!(comment_rows.iter().all(|row| comment_row(row).1.len() <= 24));
+    }
+
+    #[test]
+    fn commentable_at_cursor_reports_side_and_line() {
+        let mut app = app_with_threads(vec![thread("a.rs", Some(21), DiffSide::Right, false)]);
+        app.dispatch(Action::NextPane);
+        assert_eq!(app.focus, Focus::Diff);
+        assert_eq!(app.commentable_at_cursor(), None);
+        app.dispatch(Action::Down);
+        assert_eq!(app.commentable_at_cursor(), Some((20, DiffSide::Right, " a".to_string())));
+        app.dispatch(Action::Down);
+        assert_eq!(app.commentable_at_cursor(), Some((11, DiffSide::Left, "-b".to_string())));
+        app.dispatch(Action::Down);
+        assert_eq!(app.commentable_at_cursor(), Some((21, DiffSide::Right, "+c".to_string())));
+        app.dispatch(Action::Down);
+        assert_eq!(app.commentable_at_cursor(), None);
     }
 }

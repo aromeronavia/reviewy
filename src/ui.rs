@@ -103,9 +103,9 @@ fn render_diff(frame: &mut Frame, app: &App, area: Rect) {
         _ => app
             .diff_rows
             .iter()
-            .map(|row| {
-                let DiffRow::Line(line) = row;
-                diff_line(line)
+            .map(|row| match row {
+                DiffRow::Line(line) => diff_line(line),
+                DiffRow::Comment { text, .. } => Line::from(format!("    {text}")).dark_gray(),
             })
             .collect(),
     };
