@@ -78,6 +78,10 @@ pub const PAGE: usize = 20;
 
 const LOADING_PULL_REQUESTS: &str = "Loading pull requests…";
 
+fn loading_files_message(number: u64) -> String {
+    format!("Loading #{number}…")
+}
+
 pub struct App {
     pub repo: RepoSlug,
     pub focus: Focus,
@@ -228,11 +232,15 @@ impl App {
             Focus::PullRequests => {
                 let number = self.selected_pr()?.number;
                 self.focus = Focus::Files;
-                if self.loaded_pr == Some(number) || self.pending_pr == Some(number) {
+                if self.loaded_pr == Some(number) {
+                    self.cancel_pending_files();
+                    return None;
+                }
+                if self.pending_pr == Some(number) {
                     return None;
                 }
                 self.pending_pr = Some(number);
-                self.status = Status::Loading(format!("Loading #{number}…"));
+                self.status = Status::Loading(loading_files_message(number));
                 Some(Request::LoadFiles { number })
             }
             Focus::Files => {
@@ -240,6 +248,16 @@ impl App {
                 None
             }
             Focus::Diff => None,
+        }
+    }
+
+    /// Forgets a files request the user is no longer waiting for, so its
+    /// response cannot replace the PR they went back to.
+    fn cancel_pending_files(&mut self) {
+        if let Some(pending) = self.pending_pr.take()
+            && self.status == Status::Loading(loading_files_message(pending))
+        {
+            self.status = Status::Idle;
         }
     }
 
@@ -489,5 +507,34 @@ mod tests {
         let mut app = App::new(repo());
         app.dispatch(Action::Quit);
         assert!(app.should_quit);
+    }
+
+
+    #[test]
+    fn reopening_loaded_pr_cancels_pending_request() {
+        let mut app = app_with_pr2_opened();
+        app.apply(Response::Files { number: 2, result: Ok(two_files()) });
+        app.dispatch(Action::PrevPane);
+        app.dispatch(Action::Up);
+        assert_eq!(app.dispatch(Action::Open), Some(Request::LoadFiles { number: 1 }));
+        app.dispatch(Action::PrevPane);
+        app.dispatch(Action::Down);
+        assert_eq!(app.dispatch(Action::Open), None);
+        assert_eq!(app.focus, Focus::Files);
+        assert_eq!(app.pending_pr, None);
+        assert_eq!(app.status, Status::Idle);
+        app.apply(Response::Files { number: 1, result: Ok(vec![file("other.rs", Some("+o"))]) });
+        assert_eq!(app.loaded_pr, Some(2));
+        assert_eq!(app.files, two_files());
+    }
+
+    #[test]
+    fn reopening_loaded_pr_keeps_a_pull_request_reload_status() {
+        let mut app = app_with_pr2_opened();
+        app.apply(Response::Files { number: 2, result: Ok(two_files()) });
+        app.dispatch(Action::PrevPane);
+        app.dispatch(Action::Refresh);
+        app.dispatch(Action::Open);
+        assert_eq!(app.status, Status::Loading("Loading pull requests…".into()));
     }
 }

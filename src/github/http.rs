@@ -1,6 +1,7 @@
 //! The reqwest-backed [`PullRequestSource`] against the GitHub REST API.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -44,12 +45,16 @@ impl HttpGitHub {
     ) -> Result<Vec<T>> {
         let mut items = Vec::new();
         for page in 1..=MAX_PAGES {
-            let batch: Vec<T> = self
+            let response = self
                 .client
                 .get(page_url(path, query, page))
-                .send()?
-                .error_for_status()?
-                .json()?;
+                .send()
+                .map_err(network_error)?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!("{}", describe_status(status));
+            }
+            let batch: Vec<T> = response.json().context("unexpected response body")?;
             let last_page = batch.len() < PER_PAGE;
             items.extend(batch);
             if last_page {
@@ -58,6 +63,25 @@ impl HttpGitHub {
         }
         Ok(items)
     }
+}
+
+/// A short, footer-sized explanation of a non-2xx status. Error text is shown
+/// on one terminal row, so the status code comes first and hints stay terse.
+fn describe_status(status: StatusCode) -> String {
+    let hint = match status {
+        StatusCode::UNAUTHORIZED => "; check your token",
+        StatusCode::FORBIDDEN => "; rate limit or no access",
+        StatusCode::NOT_FOUND => "; check the repository",
+        _ => "",
+    };
+    format!("GitHub returned {status}{hint}")
+}
+
+/// Keeps only the root cause of a transport failure; reqwest's own message
+/// repeats the URL and would not fit on a terminal row.
+fn network_error(error: reqwest::Error) -> anyhow::Error {
+    let error = anyhow::Error::from(error.without_url());
+    anyhow!("network error: {}", error.root_cause())
 }
 
 /// Builds `{BASE_URL}{path}?{query...}&per_page=N&page=M`. Values are
@@ -75,7 +99,7 @@ impl PullRequestSource for HttpGitHub {
         let query = [("state", "open"), ("sort", "updated"), ("direction", "desc")];
         let wire: Vec<WirePullRequest> = self
             .get_all_pages(&path, &query)
-            .with_context(|| format!("listing pull requests for {}", self.repo))?;
+            .context("pull requests")?;
         Ok(wire.into_iter().map(PullRequest::from).collect())
     }
 
@@ -86,7 +110,7 @@ impl PullRequestSource for HttpGitHub {
         );
         let wire: Vec<WireFile> = self
             .get_all_pages(&path, &[])
-            .with_context(|| format!("loading files for #{number}"))?;
+            .with_context(|| format!("files for #{number}"))?;
         Ok(wire.into_iter().map(ChangedFile::from).collect())
     }
 }
@@ -199,5 +223,27 @@ mod tests {
         let token = crate::auth::resolve_token().unwrap();
         let prs = HttpGitHub::new(repo, token).unwrap().list_open().unwrap();
         assert!(!prs.is_empty());
+    }
+
+
+    #[test]
+    fn describes_common_statuses_with_a_hint() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            describe_status(StatusCode::UNAUTHORIZED),
+            "GitHub returned 401 Unauthorized; check your token"
+        );
+        assert_eq!(
+            describe_status(StatusCode::NOT_FOUND),
+            "GitHub returned 404 Not Found; check the repository"
+        );
+        assert_eq!(
+            describe_status(StatusCode::FORBIDDEN),
+            "GitHub returned 403 Forbidden; rate limit or no access"
+        );
+        assert_eq!(
+            describe_status(StatusCode::INTERNAL_SERVER_ERROR),
+            "GitHub returned 500 Internal Server Error"
+        );
     }
 }

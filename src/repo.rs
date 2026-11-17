@@ -23,18 +23,14 @@ impl RepoSlug {
         }
     }
 
-    /// Parses the GitHub repository out of a git remote URL.
+    /// Parses the GitHub repository out of a git remote URL, in any of the
+    /// forms git uses: `git@github.com:o/n.git`, `https://github.com/o/n`,
+    /// `ssh://git@github.com/o/n.git`, with or without `user:password@`.
     pub fn from_remote_url(url: &str) -> Result<RepoSlug> {
-        const PREFIXES: [&str; 3] = [
-            "git@github.com:",
-            "https://github.com/",
-            "ssh://git@github.com/",
-        ];
         let url = url.trim();
-        let path = PREFIXES
-            .iter()
-            .find_map(|prefix| url.strip_prefix(prefix))
-            .ok_or_else(|| anyhow!("remote `{url}` is not a GitHub remote"))?;
+        let path = github_path(url).ok_or_else(|| {
+            anyhow!("remote `{}` is not a GitHub remote", redact_userinfo(url))
+        })?;
         let path = path
             .trim_end_matches('/')
             .trim_end_matches(".git")
@@ -53,6 +49,29 @@ impl RepoSlug {
         }
         let url = String::from_utf8_lossy(&output.stdout);
         RepoSlug::from_remote_url(&url)
+    }
+}
+
+/// The part of a remote URL after the GitHub host, or `None` when the
+/// remote points somewhere else.
+fn github_path(url: &str) -> Option<&str> {
+    if let Some(path) = url.strip_prefix("git@github.com:") {
+        return Some(path);
+    }
+    let (_, after_scheme) = url.split_once("://")?;
+    let host_and_path = after_scheme
+        .rsplit_once('@')
+        .map_or(after_scheme, |(_, rest)| rest);
+    host_and_path.strip_prefix("github.com/")
+}
+
+/// Replaces any `user:password@` in a URL so it can be echoed safely.
+fn redact_userinfo(url: &str) -> String {
+    match (url.split_once("://"), url.rsplit_once('@')) {
+        (Some((scheme, _)), Some((_, host_and_path))) => {
+            format!("{scheme}://<redacted>@{host_and_path}")
+        }
+        _ => url.to_string(),
     }
 }
 
@@ -109,5 +128,25 @@ mod tests {
     fn rejects_non_github_remote() {
         let err = RepoSlug::from_remote_url("https://gitlab.com/owner/name.git").unwrap_err();
         assert!(err.to_string().contains("GitHub"));
+    }
+
+
+    #[test]
+    fn parses_https_remote_with_credentials() {
+        assert_eq!(
+            RepoSlug::from_remote_url("https://user:secret@github.com/owner/name.git")
+                .unwrap()
+                .to_string(),
+            "owner/name"
+        );
+    }
+
+    #[test]
+    fn error_does_not_echo_credentials() {
+        let err = RepoSlug::from_remote_url("https://user:secret@gitlab.com/owner/name.git")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("secret"), "{err}");
+        assert!(err.contains("gitlab.com"), "{err}");
     }
 }

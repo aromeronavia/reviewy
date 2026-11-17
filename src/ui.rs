@@ -120,11 +120,17 @@ fn diff_line(line: &crate::diff::DiffLine) -> Line<'_> {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    // An error is the one thing the footer exists to show; give it the whole
+    // row so the status code survives on an 80-column terminal.
+    if let Status::Error(message) = &app.status {
+        let line = Line::from(format!(" Error: {message}")).red();
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let status = match &app.status {
         Status::Loading(message) => Line::from(message.as_str()).yellow(),
-        Status::Error(message) => Line::from(format!("Error: {message}")).red(),
         Status::Idle if app.prs.is_empty() => Line::from(NO_PULL_REQUESTS).dark_gray(),
-        Status::Idle => Line::default(),
+        Status::Idle | Status::Error(_) => Line::default(),
     };
     let hints_width = KEY_HINTS.len() as u16;
     let [hints, right] =
@@ -230,5 +236,16 @@ mod tests {
         app.apply(Response::PullRequests(Err("boom".into())));
         let text = draw(&app, 80, 24);
         assert!(text.contains("Error: boom"), "{text}");
+    }
+
+
+    #[test]
+    fn renders_long_error_with_status_code_at_80_columns() {
+        let mut app = App::new(repo());
+        app.apply(Response::PullRequests(Err(
+            "pull requests: GitHub returned 401 Unauthorized; check your token".into(),
+        )));
+        let text = draw(&app, 80, 24);
+        assert!(text.contains("401 Unauthorized; check your token"), "{text}");
     }
 }

@@ -6,7 +6,7 @@
 
 **Architecture:** Pure state machine (`App`) driven by `Action`s from the keymap and `Response`s from a single background worker thread that talks to the GitHub REST API through a `PullRequestSource` trait. The UI draws `App` each frame. No async runtime; threads talk over `std::sync::mpsc`.
 
-**Tech Stack:** Rust 2021, ratatui 0.30 (crossterm via `ratatui::crossterm`), reqwest 0.13 blocking + json, serde + serde_json, anyhow.
+**Tech Stack:** Rust 2024, ratatui 0.30 (crossterm via `ratatui::crossterm`), reqwest 0.13 blocking + json, serde + serde_json, anyhow.
 
 **Spec:** `docs/superpowers/specs/2026-11-17-reviewy-design.md`
 
