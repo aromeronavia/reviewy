@@ -4,5 +4,6 @@ mod diff;
 mod github;
 mod keymap;
 mod repo;
+mod ui;
 
 fn main() {}
