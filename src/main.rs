@@ -5,5 +5,6 @@ mod github;
 mod keymap;
 mod repo;
 mod ui;
+mod worker;
 
 fn main() {}

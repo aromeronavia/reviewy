@@ -1,4 +1,4 @@
-// pub mod http; // written in Task 7
+pub mod http;
 
 use anyhow::Result;
 
