@@ -1,3 +1,4 @@
+mod app;
 mod auth;
 mod diff;
 mod github;
