@@ -6,13 +6,17 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, ConvRow, ConvRowKind, DiffRow, Focus, Mode, Tab, Viewport, conversation_rows};
+use crate::app::{
+    App, Compose, ComposeTarget, ConvRow, ConvRowKind, DiffRow, Focus, Mode, Tab, Viewport,
+    conversation_rows,
+};
 use crate::diff::DiffLineKind;
-use crate::github::{ChecksState, FileStatus, PullRequest, ReviewDecision};
+use crate::github::{ChecksState, FileStatus, PullRequest, ReviewDecision, ReviewEvent};
 
+const TAB: &str = "    ";
 const NO_PATCH: &str = "No diff available for this file";
 const NO_PULL_REQUESTS: &str = "No open pull requests";
 const NO_OPENED_PR: &str = "Open a pull request to read its conversation";
@@ -38,6 +42,11 @@ pub fn render(frame: &mut Frame, app: &App) -> Viewport {
         Tab::Conversation => render_conversation(frame, app, content),
     }
     render_status_bar(frame, app, footer);
+    match &app.mode {
+        Mode::Browse => {}
+        Mode::PickReviewEvent => render_pick_overlay(frame, app),
+        Mode::Compose(compose) => render_compose_overlay(frame, app, compose),
+    }
 
     // Both sides are measured every frame so the app can clamp scrolling for
     // whichever tab the user switches to next.
@@ -167,30 +176,53 @@ fn render_diff(frame: &mut Frame, app: &App, area: Rect) {
     };
     let block = pane(title, app.focus == Focus::Diff);
     let height = block.inner(area).height as usize;
+    let cursor_visible = app.focus == Focus::Diff;
     let lines: Vec<Line> = match app.selected_file() {
         Some(file) if file.patch.is_none() => vec![Line::from(NO_PATCH).dark_gray()],
         _ => app
             .diff_rows
             .iter()
+            .enumerate()
             .skip(app.diff_offset)
             .take(height)
-            .map(|row| match row {
-                DiffRow::Line(line) => diff_line(line),
-                DiffRow::Comment { text, .. } => Line::from(format!("    {text}")).dark_gray(),
+            .map(|(index, row)| {
+                let line = diff_row(row);
+                if cursor_visible && index == app.diff_cursor {
+                    line.reversed()
+                } else {
+                    line
+                }
             })
             .collect(),
     };
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn diff_line(line: &crate::diff::DiffLine) -> Line<'_> {
-    let style = match line.kind {
-        DiffLineKind::Added => Style::new().fg(Color::Green),
-        DiffLineKind::Removed => Style::new().fg(Color::Red),
-        DiffLineKind::Hunk => Style::new().fg(Color::Cyan),
-        DiffLineKind::Context => Style::new(),
-    };
-    Line::styled(line.text.as_str(), style)
+fn diff_row(row: &DiffRow) -> Line<'static> {
+    match row {
+        DiffRow::Line(line) => {
+            let style = match line.kind {
+                DiffLineKind::Added => Style::new().fg(Color::Green),
+                DiffLineKind::Removed => Style::new().fg(Color::Red),
+                DiffLineKind::Hunk => Style::new().fg(Color::Cyan),
+                DiffLineKind::Context => Style::new(),
+            };
+            Line::styled(line.text.replace('\t', TAB), style)
+        }
+        DiffRow::Comment {
+            header,
+            text,
+            pending,
+        } => {
+            let color = if *pending { Color::Yellow } else { Color::Magenta };
+            let mut spans = vec![Span::raw(TAB)];
+            if let Some(header) = header {
+                spans.push(Span::styled(format!("{header}: "), Style::new().fg(color).bold()));
+            }
+            spans.push(Span::styled(text.clone(), Style::new().fg(color)));
+            Line::from(spans)
+        }
+    }
 }
 
 fn render_conversation(frame: &mut Frame, app: &App, area: Rect) {
@@ -224,6 +256,86 @@ fn conversation_line(row: ConvRow) -> Line<'static> {
         ConvRowKind::Thread => Style::new().fg(Color::Yellow),
     };
     Line::styled(row.text, style)
+}
+
+// ---- overlays ---------------------------------------------------------------
+
+/// A box of `width_pct` percent of the width and `height` rows, centered.
+fn centered(area: Rect, width_pct: u16, height: Constraint) -> Rect {
+    let [_, middle, _] =
+        Layout::vertical([Constraint::Fill(1), height, Constraint::Fill(1)]).areas(area);
+    let [_, center, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Percentage(width_pct),
+        Constraint::Fill(1),
+    ])
+    .areas(middle);
+    center
+}
+
+fn render_pick_overlay(frame: &mut Frame, app: &App) {
+    let area = centered(frame.area(), 60, Constraint::Length(5));
+    let number = app.opened.unwrap_or(0);
+    let block = Block::bordered()
+        .title(format!(" Review #{number} "))
+        .border_style(Style::new().fg(Color::Yellow));
+    let text = Line::from(vec![
+        "(a) approve".green().bold(),
+        Span::raw("  "),
+        "(r) request changes".red().bold(),
+        Span::raw("  "),
+        "(c) comment".bold(),
+        Span::raw("  "),
+        "Esc cancel".dark_gray(),
+    ]);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: true }).block(block),
+        area,
+    );
+}
+
+fn render_compose_overlay(frame: &mut Frame, app: &App, compose: &Compose) {
+    let area = centered(frame.area(), 70, Constraint::Percentage(50));
+    let number = app.opened.unwrap_or(0);
+    let title = match &compose.target {
+        ComposeTarget::PullRequestComment => format!("Comment on #{number}"),
+        ComposeTarget::LineComment { path, line, .. } => format!("Comment on {path}:{line}"),
+        ComposeTarget::Review { event } => match event {
+            ReviewEvent::Approve => format!("Approve #{number}"),
+            ReviewEvent::RequestChanges => format!("Request changes on #{number}"),
+            ReviewEvent::Comment => format!("Comment review on #{number}"),
+        },
+    };
+    let block = Block::bordered()
+        .title(format!(" {title} "))
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(area);
+    let [text_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let ComposeTarget::LineComment { excerpt, .. } = &compose.target {
+        lines.push(Line::from(excerpt.replace('\t', TAB)).dark_gray());
+    }
+    let typed: Vec<&str> = compose.text.split('\n').collect();
+    let last = typed.len() - 1;
+    for (index, line) in typed.iter().enumerate() {
+        let text = if index == last { format!("{line}▏") } else { line.to_string() };
+        lines.push(Line::from(text));
+    }
+    // Keep the end of the text, where the cursor is, on screen.
+    let visible = text_area.height as usize;
+    let skip = lines.len().saturating_sub(visible);
+    let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), text_area);
+    frame.render_widget(
+        Paragraph::new(Line::from("Ctrl-s send · Esc cancel · Enter newline").dark_gray()),
+        hint_area,
+    );
 }
 
 // ---- status bar -------------------------------------------------------------
@@ -300,8 +412,8 @@ mod tests {
     use super::*;
     use crate::app::{Action, App, Response};
     use crate::github::{
-        ChangedFile, ChecksState, Comment, Conversation, FileStatus, PullRequest, ReviewDecision,
-        ReviewState,
+        ChangedFile, ChecksState, Comment, Conversation, DiffSide, FileStatus, PullRequest,
+        ReviewDecision, ReviewEvent, ReviewState, Thread,
     };
     use crate::repo::RepoSlug;
     use ratatui::{Terminal, backend::TestBackend};
@@ -529,5 +641,94 @@ mod tests {
         app.dispatch(Action::ToggleTab);
         let _ = draw(&app, 20, 5);
         let _ = draw(&app, 1, 1);
+    }
+
+    // ---- Task 9 ----
+
+    fn app_in_diff_on_added_line() -> App {
+        let mut app = app_with_file(Some("@@ -1 +1 @@\n-x\n+y"));
+        app.dispatch(Action::NextPane);
+        app.dispatch(Action::Down);
+        app.dispatch(Action::Down);
+        assert_eq!(app.commentable_at_cursor().map(|c| c.0), Some(1));
+        app
+    }
+
+    #[test]
+    fn diff_shows_inline_comment_rows() {
+        let mut app = app_with_file(Some("@@ -1 +1 @@\n-x\n+y"));
+        let conversation = Conversation {
+            threads: vec![Thread {
+                path: "src/a.rs".into(),
+                line: Some(1),
+                side: DiffSide::Right,
+                outdated: false,
+                resolved: false,
+                comments: vec![Comment {
+                    author: "ann".into(),
+                    created_at: "2026-01-02T00:00:00Z".into(),
+                    body: "why?".into(),
+                    review_state: None,
+                }],
+            }],
+            ..Conversation::default()
+        };
+        app.apply(Response::Conversation { number: 1, result: Ok(conversation) });
+        let text = draw(&app, 100, 30);
+        assert!(text.contains("ann · 2026-01-02"), "{text}");
+        assert!(text.contains("why?"), "{text}");
+        assert!(text.find("+y").unwrap() < text.find("why?").unwrap(), "{text}");
+    }
+
+    #[test]
+    fn compose_overlay_shows_title_and_text() {
+        let mut app = app_in_diff_on_added_line();
+        app.dispatch(Action::Comment);
+        for c in "hello".chars() {
+            app.dispatch(Action::Type(c));
+        }
+        let text = draw(&app, 100, 30);
+        assert!(text.contains("Comment on src/a.rs:1"), "{text}");
+        assert!(text.contains("hello▏"), "{text}");
+        assert!(text.contains("+y"), "{text}");
+        assert!(text.contains("Ctrl-s send"), "{text}");
+    }
+
+    #[test]
+    fn pick_overlay_lists_verdicts() {
+        let mut app = app_with_file(Some("+x"));
+        app.dispatch(Action::Review);
+        let text = draw(&app, 100, 30);
+        assert!(text.contains("Review #1"), "{text}");
+        assert!(text.contains("(a) approve"), "{text}");
+        assert!(text.contains("(r) request changes"), "{text}");
+        assert!(text.contains("(c) comment"), "{text}");
+    }
+
+    #[test]
+    fn review_compose_overlay_names_the_verdict() {
+        let mut app = app_with_file(Some("+x"));
+        app.dispatch(Action::Review);
+        app.dispatch(Action::Pick(ReviewEvent::RequestChanges));
+        let text = draw(&app, 100, 30);
+        assert!(text.contains("Request changes on #1"), "{text}");
+    }
+
+    #[test]
+    fn ui_expands_tabs_in_diff_lines() {
+        let app = app_with_file(Some("+\tx"));
+        let text = draw(&app, 100, 30);
+        assert!(text.contains("+    x"), "{text}");
+    }
+
+    #[test]
+    fn overlays_render_in_tiny_terminal() {
+        let mut app = app_in_diff_on_added_line();
+        app.dispatch(Action::Comment);
+        let _ = draw(&app, 20, 5);
+        let _ = draw(&app, 1, 1);
+        app.dispatch(Action::Cancel);
+        app.dispatch(Action::Review);
+        let _ = draw(&app, 20, 5);
     }
 }

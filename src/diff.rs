@@ -18,8 +18,6 @@ pub struct DiffLine {
     pub new_line: Option<u64>,
 }
 
-const TAB_WIDTH: usize = 4;
-
 /// Splits a per-file patch (as returned by the GitHub API) into typed lines.
 pub fn parse_patch(patch: &str) -> Vec<DiffLine> {
     let (mut old, mut new) = (0u64, 0u64);
@@ -27,7 +25,7 @@ pub fn parse_patch(patch: &str) -> Vec<DiffLine> {
         .lines()
         .map(|line| {
             let kind = classify(line);
-            let text = line.replace('\t', &" ".repeat(TAB_WIDTH));
+            let text = line.to_string();
             let (old_line, new_line) = match kind {
                 DiffLineKind::Hunk => {
                     if let Some((start_old, start_new)) = hunk_start(line) {
@@ -99,8 +97,8 @@ mod tests {
     }
 
     #[test]
-    fn expands_tabs_to_four_spaces() {
-        assert_eq!(parse_patch("+\tx")[0].text, "+    x");
+    fn keeps_tabs_verbatim() {
+        assert_eq!(parse_patch("+\tx")[0].text, "+\tx");
     }
 
     #[test]
