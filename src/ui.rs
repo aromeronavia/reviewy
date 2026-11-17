@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Block, List, ListItem, ListState, Paragraph},
 };
 
-use crate::app::{App, Focus, Status};
+use crate::app::{App, DiffRow, Focus};
 use crate::diff::DiffLineKind;
 use crate::github::FileStatus;
 
@@ -100,9 +100,16 @@ fn render_diff(frame: &mut Frame, app: &App, area: Rect) {
     };
     let lines: Vec<Line> = match app.selected_file() {
         Some(file) if file.patch.is_none() => vec![Line::from(NO_PATCH).dark_gray()],
-        _ => app.diff.iter().map(diff_line).collect(),
+        _ => app
+            .diff_rows
+            .iter()
+            .map(|row| {
+                let DiffRow::Line(line) = row;
+                diff_line(line)
+            })
+            .collect(),
     };
-    let scroll = u16::try_from(app.diff_scroll).unwrap_or(u16::MAX);
+    let scroll = u16::try_from(app.diff_offset).unwrap_or(u16::MAX);
     let paragraph = Paragraph::new(lines)
         .block(pane(title, app.focus == Focus::Diff))
         .scroll((scroll, 0));
@@ -122,15 +129,21 @@ fn diff_line(line: &crate::diff::DiffLine) -> Line<'_> {
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     // An error is the one thing the footer exists to show; give it the whole
     // row so the status code survives on an 80-column terminal.
-    if let Status::Error(message) = &app.status {
-        let line = Line::from(format!(" Error: {message}")).red();
+    if let Some(notice) = &app.notice
+        && notice.error
+    {
+        let line = Line::from(format!(" Error: {}", notice.text)).red();
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let status = match &app.status {
-        Status::Loading(message) => Line::from(message.as_str()).yellow(),
-        Status::Idle if app.prs.is_empty() => Line::from(NO_PULL_REQUESTS).dark_gray(),
-        Status::Idle | Status::Error(_) => Line::default(),
+    let status = if let Some(busy) = app.busy_message() {
+        Line::from(busy).yellow()
+    } else if let Some(notice) = &app.notice {
+        Line::from(notice.text.clone()).green()
+    } else if app.prs.is_empty() {
+        Line::from(NO_PULL_REQUESTS).dark_gray()
+    } else {
+        Line::default()
     };
     let hints_width = KEY_HINTS.len() as u16;
     let [hints, right] =

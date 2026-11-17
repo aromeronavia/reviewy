@@ -17,7 +17,7 @@ use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-use app::{App, Request, Response};
+use app::{Action, App, Request, Response};
 use github::http::HttpGitHub;
 use repo::RepoSlug;
 
@@ -57,7 +57,9 @@ fn start(repo_arg: Option<&str>) -> Result<()> {
     let source = Arc::new(HttpGitHub::new(repo.clone(), token)?);
     let (requests, responses) = worker::spawn(source);
     let mut app = App::new(repo);
-    requests.send(Request::LoadPullRequests)?;
+    for request in app.dispatch(Action::Refresh) {
+        requests.send(request)?;
+    }
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, &requests, &responses);
@@ -76,12 +78,16 @@ fn run(
         if event::poll(POLL_INTERVAL)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && let Some(request) = keymap::action_for(key).and_then(|action| app.dispatch(action))
+            && let Some(action) = keymap::action_for(key)
         {
-            requests.send(request)?;
+            for request in app.dispatch(action) {
+                requests.send(request)?;
+            }
         }
         while let Ok(response) = responses.try_recv() {
-            app.apply(response);
+            for request in app.apply(response) {
+                requests.send(request)?;
+            }
         }
     }
     Ok(())
