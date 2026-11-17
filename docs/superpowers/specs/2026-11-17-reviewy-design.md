@@ -39,8 +39,8 @@ already holds.
 
 ## Constraints
 
-- Rust 2021 edition, stable toolchain (cargo 1.100 on this machine).
-- Crates: ratatui 0.30, reqwest 0.13 (blocking + json), serde 1 (derive),
+- Rust 2024 edition, stable toolchain (cargo 1.100 on this machine).
+- Crates: ratatui 0.30, reqwest 0.13 (blocking + json + native-tls, because the rustls default needs cmake and this machine has none), serde 1 (derive),
   serde_json 1, anyhow 1. Crossterm is used through `ratatui::crossterm` so
   the two never drift apart.
 - Networking runs on one background thread; the UI thread talks to it over

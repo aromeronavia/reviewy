@@ -12,8 +12,8 @@
 
 ## Global Constraints
 
-- Rust 2021 edition on the stable toolchain already installed (cargo 1.100).
-- Dependencies limited to: `ratatui = "0.30"`, `reqwest = { version = "0.13", features = ["blocking", "json"] }`, `serde = { version = "1", features = ["derive"] }`, `serde_json = "1"`, `anyhow = "1"`.
+- Rust 2024 edition on the stable toolchain already installed (cargo 1.100).
+- Dependencies limited to: `ratatui = "0.30"`, `reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }`, `serde = { version = "1", features = ["derive"] }`, `serde_json = "1"`, `anyhow = "1"`.
 - Crossterm types come only from `ratatui::crossterm`; never add `crossterm` to `Cargo.toml`.
 - `app.rs` imports nothing from `ratatui` or `reqwest`.
 - The token is never printed, logged, or put in an error message.
