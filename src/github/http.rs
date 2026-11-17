@@ -254,15 +254,19 @@ fn comment_payload(body: &str) -> Value {
     json!({ "body": body })
 }
 
-/// The body for `POST pulls/{n}/reviews`. `body` and `comments` are left out
-/// when empty: GitHub rejects an empty `comments` array on an approval.
+/// The body for `POST pulls/{n}/reviews`. `commit_id`, `body` and `comments`
+/// are left out when empty: GitHub rejects an empty `comments` array on an
+/// approval and defaults `commit_id` to the head commit.
 fn review_payload(review: &ReviewSubmission) -> Value {
     let event = match review.event {
         ReviewEvent::Approve => "APPROVE",
         ReviewEvent::RequestChanges => "REQUEST_CHANGES",
         ReviewEvent::Comment => "COMMENT",
     };
-    let mut payload = json!({ "event": event, "commit_id": review.commit_sha });
+    let mut payload = json!({ "event": event });
+    if !review.commit_sha.is_empty() {
+        payload["commit_id"] = Value::String(review.commit_sha.clone());
+    }
     if !review.body.is_empty() {
         payload["body"] = Value::String(review.body.clone());
     }
@@ -691,6 +695,17 @@ mod tests {
             comments: vec![],
         };
         assert_eq!(review_payload(&review), json!({"event": "APPROVE", "commit_id": "abc"}));
+    }
+
+    #[test]
+    fn review_payload_omits_empty_commit() {
+        let review = ReviewSubmission {
+            event: ReviewEvent::Comment,
+            body: "note".into(),
+            commit_sha: String::new(),
+            comments: vec![],
+        };
+        assert_eq!(review_payload(&review), json!({"event": "COMMENT", "body": "note"}));
     }
 
     #[test]

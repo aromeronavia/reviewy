@@ -228,6 +228,8 @@ pub struct App {
     pub diff_cursor: usize,
     pub diff_offset: usize,
     pub pending_comments: Vec<NewLineComment>,
+    /// The PR the pending comments belong to.
+    pub pending_pr: Option<u64>,
     pub in_flight: Vec<InFlight>,
     pub notice: Option<Notice>,
     pub viewport: Viewport,
@@ -277,6 +279,7 @@ impl App {
             diff_cursor: 0,
             diff_offset: 0,
             pending_comments: Vec::new(),
+            pending_pr: None,
             in_flight: Vec::new(),
             notice: None,
             viewport: Viewport::default(),
@@ -337,9 +340,17 @@ impl App {
     /// Applies a user action; returns the requests to send.
     pub fn dispatch(&mut self, action: Action) -> Vec<Request> {
         self.notice = None;
+        if action == Action::Quit {
+            self.should_quit = true;
+            return Vec::new();
+        }
         match self.mode {
             Mode::Browse => self.browse(action),
-            Mode::PickReviewEvent | Mode::Compose(_) => Vec::new(),
+            Mode::PickReviewEvent => {
+                self.pick(action);
+                Vec::new()
+            }
+            Mode::Compose(_) => self.compose(action),
         }
     }
 
@@ -393,14 +404,40 @@ impl App {
             }
             Response::CommentPosted { number, result } => {
                 self.settle(InFlight::Comment(number));
-                if let Err(message) = result {
-                    self.fail(message);
+                match result {
+                    Ok(()) => {
+                        self.hint(&format!("Comment posted on #{number}"));
+                        if self.opened == Some(number)
+                            && !self.is_loading(InFlight::Conversation(number))
+                        {
+                            return vec![self.track(Request::LoadConversation { number })];
+                        }
+                    }
+                    Err(message) => self.fail(message),
                 }
             }
             Response::ReviewSubmitted { number, result } => {
                 self.settle(InFlight::Review(number));
-                if let Err(message) = result {
-                    self.fail(message);
+                match result {
+                    Ok(()) => {
+                        if self.pending_pr == Some(number) {
+                            self.pending_comments.clear();
+                            self.pending_pr = None;
+                            self.rebuild_diff_rows();
+                        }
+                        self.hint(&format!("Review submitted for #{number}"));
+                        let mut follow_ups = Vec::new();
+                        if self.opened == Some(number)
+                            && !self.is_loading(InFlight::Conversation(number))
+                        {
+                            follow_ups.push(self.track(Request::LoadConversation { number }));
+                        }
+                        if !self.is_loading(InFlight::PullRequests) {
+                            follow_ups.push(self.track(Request::LoadPullRequests));
+                        }
+                        return follow_ups;
+                    }
+                    Err(message) => self.fail(message),
                 }
             }
         }
@@ -424,9 +461,9 @@ impl App {
             Action::Open => return self.open(),
             Action::Refresh => return self.refresh(),
             Action::ToggleTab => self.toggle_tab(),
-            Action::Comment
-            | Action::Review
-            | Action::Pick(_)
+            Action::Comment => self.start_comment(),
+            Action::Review => self.start_review(),
+            Action::Pick(_)
             | Action::Type(_)
             | Action::Newline
             | Action::Backspace
@@ -434,6 +471,134 @@ impl App {
             | Action::Cancel => {}
         }
         Vec::new()
+    }
+
+    fn start_comment(&mut self) {
+        let Some(opened) = self.opened else {
+            self.hint("Open a pull request first");
+            return;
+        };
+        if self.focus != Focus::Diff {
+            self.mode = Mode::Compose(Compose {
+                target: ComposeTarget::PullRequestComment,
+                text: String::new(),
+            });
+            return;
+        }
+        if let Some(other) = self.pending_pr
+            && other != opened
+        {
+            self.hint(&format!("Submit the pending review on #{other} first"));
+            return;
+        }
+        match self.commentable_at_cursor() {
+            Some((line, side, excerpt)) => {
+                let path = self
+                    .selected_file()
+                    .map(|file| file.filename.clone())
+                    .unwrap_or_default();
+                self.mode = Mode::Compose(Compose {
+                    target: ComposeTarget::LineComment { path, line, side, excerpt },
+                    text: String::new(),
+                });
+            }
+            None => self.hint("This line cannot be commented"),
+        }
+    }
+
+    fn start_review(&mut self) {
+        if self.opened.is_some() {
+            self.mode = Mode::PickReviewEvent;
+        } else {
+            self.hint("Open a pull request first");
+        }
+    }
+
+    // ---- pick and compose modes ---------------------------------------------
+
+    fn pick(&mut self, action: Action) {
+        match action {
+            Action::Pick(event) => {
+                self.mode = Mode::Compose(Compose {
+                    target: ComposeTarget::Review { event },
+                    text: String::new(),
+                });
+            }
+            Action::Cancel | Action::Escape => self.mode = Mode::Browse,
+            _ => {}
+        }
+    }
+
+    fn compose(&mut self, action: Action) -> Vec<Request> {
+        let Mode::Compose(compose) = &mut self.mode else {
+            return Vec::new();
+        };
+        match action {
+            Action::Type(c) => compose.text.push(c),
+            Action::Newline => compose.text.push('\n'),
+            Action::Backspace => {
+                compose.text.pop();
+            }
+            Action::Cancel | Action::Escape => self.mode = Mode::Browse,
+            Action::Submit => return self.submit(),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// Sends what was composed, or refuses with a notice and stays in the box.
+    fn submit(&mut self) -> Vec<Request> {
+        let (target, body) = match &self.mode {
+            Mode::Compose(compose) => (compose.target.clone(), compose.text.trim().to_string()),
+            _ => return Vec::new(),
+        };
+        let Some(number) = self.opened else {
+            self.mode = Mode::Browse;
+            return Vec::new();
+        };
+        match target {
+            ComposeTarget::PullRequestComment => {
+                if body.is_empty() {
+                    return self.refuse("Comment is empty");
+                }
+                self.mode = Mode::Browse;
+                vec![self.track(Request::PostComment { number, body })]
+            }
+            ComposeTarget::LineComment { path, line, side, .. } => {
+                if body.is_empty() {
+                    return self.refuse("Comment is empty");
+                }
+                self.pending_pr = Some(number);
+                self.pending_comments.push(NewLineComment { path, line, side, body });
+                self.mode = Mode::Browse;
+                self.rebuild_diff_rows();
+                self.hint(&format!("Pending comments: {}", self.pending_comments.len()));
+                Vec::new()
+            }
+            ComposeTarget::Review { event } => {
+                let comments = if self.pending_pr == Some(number) {
+                    self.pending_comments.clone()
+                } else {
+                    Vec::new()
+                };
+                match event {
+                    ReviewEvent::RequestChanges if body.is_empty() => {
+                        return self.refuse("Request changes needs a body");
+                    }
+                    ReviewEvent::Comment if body.is_empty() && comments.is_empty() => {
+                        return self.refuse("A comment review needs a body or line comments");
+                    }
+                    _ => {}
+                }
+                let commit_sha = self
+                    .opened_pr()
+                    .map(|pr| pr.head_sha.clone())
+                    .unwrap_or_default();
+                self.mode = Mode::Browse;
+                let review = ReviewSubmission { event, body, commit_sha, comments };
+                vec![self.track(Request::SubmitReview { number, review })]
+            }
+        }
     }
 
     fn cycle_focus(&mut self, step: isize) {
@@ -553,6 +718,21 @@ impl App {
         });
     }
 
+    fn hint(&mut self, text: &str) {
+        self.notice = Some(Notice {
+            text: text.to_string(),
+            error: false,
+        });
+    }
+
+    fn refuse(&mut self, text: &str) -> Vec<Request> {
+        self.notice = Some(Notice {
+            text: text.to_string(),
+            error: true,
+        });
+        Vec::new()
+    }
+
     fn pr_by_number(&self, number: u64) -> Option<&PullRequest> {
         self.prs.iter().find(|pr| pr.number == number)
     }
@@ -590,7 +770,7 @@ impl App {
             let pending: Vec<_> = self
                 .pending_comments
                 .iter()
-                .filter(|comment| comment.path == path)
+                .filter(|comment| self.pending_pr == self.opened && comment.path == path)
                 .collect();
             for line in file.patch.as_deref().map(parse_patch).unwrap_or_default() {
                 let anchor = anchor_of(&line);
@@ -1335,6 +1515,7 @@ mod tests {
     #[test]
     fn pending_comments_follow_existing_threads() {
         let mut app = app_with_threads(vec![thread("a.rs", Some(21), DiffSide::Right, false)]);
+        app.pending_pr = Some(2);
         app.pending_comments.push(NewLineComment {
             path: "a.rs".into(),
             line: 21,
@@ -1378,5 +1559,301 @@ mod tests {
         assert_eq!(app.commentable_at_cursor(), Some((21, DiffSide::Right, "+c".to_string())));
         app.dispatch(Action::Down);
         assert_eq!(app.commentable_at_cursor(), None);
+    }
+
+    // ---- compose flows (Task 6) ----
+
+    /// Files and an empty conversation loaded for #2, focus in the diff, cursor on "+c".
+    fn diff_focused_app() -> App {
+        let mut app = app_with_threads(vec![]);
+        app.dispatch(Action::NextPane);
+        for _ in 0..3 {
+            app.dispatch(Action::Down);
+        }
+        assert_eq!(app.commentable_at_cursor().map(|c| c.0), Some(21));
+        app
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.dispatch(Action::Type(c));
+        }
+    }
+
+    fn compose_text(app: &App) -> &str {
+        match &app.mode {
+            Mode::Compose(compose) => compose.text.as_str(),
+            other => panic!("not composing: {other:?}"),
+        }
+    }
+
+    fn pending_mine() -> NewLineComment {
+        NewLineComment {
+            path: "a.rs".into(),
+            line: 21,
+            side: DiffSide::Right,
+            body: "mine".into(),
+        }
+    }
+
+    #[test]
+    fn comment_on_diff_line_opens_line_compose() {
+        let mut app = diff_focused_app();
+        assert_eq!(app.dispatch(Action::Comment), vec![]);
+        assert_eq!(
+            app.mode,
+            Mode::Compose(Compose {
+                target: ComposeTarget::LineComment {
+                    path: "a.rs".into(),
+                    line: 21,
+                    side: DiffSide::Right,
+                    excerpt: "+c".into(),
+                },
+                text: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn comment_on_hunk_header_is_refused() {
+        let mut app = app_with_threads(vec![]);
+        app.dispatch(Action::NextPane);
+        app.dispatch(Action::Comment);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.notice, Some(Notice { text: "This line cannot be commented".into(), error: false }));
+    }
+
+    #[test]
+    fn comment_without_open_pr_is_refused() {
+        let mut app = App::new(repo());
+        app.apply(Response::PullRequests(Ok(vec![pr(1)])));
+        app.dispatch(Action::Comment);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.notice.as_ref().map(|n| n.text.as_str()), Some("Open a pull request first"));
+        app.dispatch(Action::Review);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.notice.is_some());
+    }
+
+    #[test]
+    fn comment_elsewhere_opens_pr_compose() {
+        let mut app = loaded_app();
+        assert_eq!(app.focus, Focus::Files);
+        app.dispatch(Action::Comment);
+        assert_eq!(
+            app.mode,
+            Mode::Compose(Compose { target: ComposeTarget::PullRequestComment, text: String::new() })
+        );
+    }
+
+    #[test]
+    fn typing_edits_compose_text() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "hi");
+        app.dispatch(Action::Newline);
+        app.dispatch(Action::Type('x'));
+        app.dispatch(Action::Backspace);
+        assert_eq!(compose_text(&app), "hi\n");
+    }
+
+    #[test]
+    fn cancel_discards_compose() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "draft");
+        app.dispatch(Action::Cancel);
+        assert_eq!(app.mode, Mode::Browse);
+        app.dispatch(Action::Comment);
+        assert_eq!(compose_text(&app), "");
+    }
+
+    #[test]
+    fn escape_cancels_pick_and_compose() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Review);
+        assert_eq!(app.mode, Mode::PickReviewEvent);
+        app.dispatch(Action::Escape);
+        assert_eq!(app.mode, Mode::Browse);
+        app.dispatch(Action::Comment);
+        app.dispatch(Action::Escape);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.focus, Focus::Files);
+    }
+
+    #[test]
+    fn submitting_line_comment_adds_pending_and_rows() {
+        let mut app = diff_focused_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "mine");
+        assert_eq!(app.dispatch(Action::Submit), vec![]);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.pending_comments, vec![pending_mine()]);
+        assert_eq!(app.pending_pr, Some(2));
+        assert_eq!(comment_row(&app.diff_rows[4]), (Some("pending"), "mine", true));
+        assert_eq!(app.notice, Some(Notice { text: "Pending comments: 1".into(), error: false }));
+    }
+
+    #[test]
+    fn submitting_empty_comment_is_refused() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "  ");
+        assert_eq!(app.dispatch(Action::Submit), vec![]);
+        assert!(matches!(app.mode, Mode::Compose(_)));
+        assert_eq!(app.notice, Some(Notice { text: "Comment is empty".into(), error: true }));
+    }
+
+    #[test]
+    fn submitting_pr_comment_posts_and_reloads_on_success() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "hello");
+        assert_eq!(
+            app.dispatch(Action::Submit),
+            vec![Request::PostComment { number: 2, body: "hello".into() }]
+        );
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.is_loading(InFlight::Comment(2)));
+        let follow_ups = app.apply(Response::CommentPosted { number: 2, result: Ok(()) });
+        assert_eq!(follow_ups, vec![Request::LoadConversation { number: 2 }]);
+        assert!(app.is_loading(InFlight::Conversation(2)));
+        assert!(!app.is_loading(InFlight::Comment(2)));
+        assert!(app.notice.as_ref().is_some_and(|n| n.text.contains("posted") && !n.error));
+    }
+
+    #[test]
+    fn review_flow_picks_event_then_submits_with_pending() {
+        let mut app = diff_focused_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "mine");
+        app.dispatch(Action::Submit);
+        app.dispatch(Action::Review);
+        assert_eq!(app.mode, Mode::PickReviewEvent);
+        assert_eq!(app.dispatch(Action::Down), vec![]);
+        app.dispatch(Action::Pick(ReviewEvent::Approve));
+        assert!(matches!(
+            &app.mode,
+            Mode::Compose(c) if c.target == ComposeTarget::Review { event: ReviewEvent::Approve }
+        ));
+        type_text(&mut app, "ship it");
+        let review = ReviewSubmission {
+            event: ReviewEvent::Approve,
+            body: "ship it".into(),
+            commit_sha: "sha2".into(),
+            comments: vec![pending_mine()],
+        };
+        assert_eq!(
+            app.dispatch(Action::Submit),
+            vec![Request::SubmitReview { number: 2, review }]
+        );
+        assert!(app.is_loading(InFlight::Review(2)));
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn request_changes_requires_body() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Review);
+        app.dispatch(Action::Pick(ReviewEvent::RequestChanges));
+        assert_eq!(app.dispatch(Action::Submit), vec![]);
+        assert!(matches!(app.mode, Mode::Compose(_)));
+        assert_eq!(app.notice, Some(Notice { text: "Request changes needs a body".into(), error: true }));
+    }
+
+    #[test]
+    fn comment_review_needs_body_or_pending() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Review);
+        app.dispatch(Action::Pick(ReviewEvent::Comment));
+        assert_eq!(app.dispatch(Action::Submit), vec![]);
+        assert_eq!(
+            app.notice,
+            Some(Notice { text: "A comment review needs a body or line comments".into(), error: true })
+        );
+        app.dispatch(Action::Cancel);
+        app.dispatch(Action::Review);
+        app.dispatch(Action::Pick(ReviewEvent::Approve));
+        assert_eq!(app.dispatch(Action::Submit).len(), 1);
+    }
+
+    #[test]
+    fn successful_review_clears_pending_and_reloads() {
+        let mut app = diff_focused_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "mine");
+        app.dispatch(Action::Submit);
+        app.dispatch(Action::Review);
+        app.dispatch(Action::Pick(ReviewEvent::Approve));
+        app.dispatch(Action::Submit);
+        let follow_ups = app.apply(Response::ReviewSubmitted { number: 2, result: Ok(()) });
+        assert_eq!(follow_ups, vec![Request::LoadConversation { number: 2 }, Request::LoadPullRequests]);
+        assert!(app.pending_comments.is_empty());
+        assert_eq!(app.pending_pr, None);
+        assert!(!app.diff_rows.iter().any(|r| matches!(r, DiffRow::Comment { pending: true, .. })));
+        assert!(app.notice.as_ref().is_some_and(|n| n.text.contains("submitted") && !n.error));
+    }
+
+    #[test]
+    fn failed_review_keeps_pending_comments() {
+        let mut app = diff_focused_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "mine");
+        app.dispatch(Action::Submit);
+        app.dispatch(Action::Review);
+        app.dispatch(Action::Pick(ReviewEvent::Approve));
+        app.dispatch(Action::Submit);
+        let follow_ups = app.apply(Response::ReviewSubmitted { number: 2, result: Err("422".into()) });
+        assert_eq!(follow_ups, vec![]);
+        assert_eq!(app.pending_comments, vec![pending_mine()]);
+        assert_eq!(app.notice, Some(Notice { text: "422".into(), error: true }));
+        assert!(!app.is_loading(InFlight::Review(2)));
+    }
+
+    #[test]
+    fn pending_comments_belong_to_one_pr() {
+        let mut app = diff_focused_app();
+        app.dispatch(Action::Comment);
+        type_text(&mut app, "mine");
+        app.dispatch(Action::Submit);
+        app.dispatch(Action::Escape);
+        app.dispatch(Action::Escape);
+        app.dispatch(Action::Up);
+        app.dispatch(Action::Open);
+        app.apply(Response::Files { number: 1, result: Ok(two_files()) });
+        app.apply(Response::Conversation { number: 1, result: Ok(Conversation::default()) });
+        assert!(!app.diff_rows.iter().any(|r| matches!(r, DiffRow::Comment { .. })));
+        app.dispatch(Action::NextPane);
+        app.dispatch(Action::Bottom);
+        app.dispatch(Action::Comment);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.notice.as_ref().is_some_and(|n| n.text.contains("#2")), "{:?}", app.notice);
+        app.dispatch(Action::Review);
+        app.dispatch(Action::Pick(ReviewEvent::Approve));
+        match app.dispatch(Action::Submit).as_slice() {
+            [Request::SubmitReview { number: 1, review }] => assert!(review.comments.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+        app.apply(Response::ReviewSubmitted { number: 1, result: Ok(()) });
+        assert_eq!(app.pending_comments, vec![pending_mine()]);
+    }
+
+    #[test]
+    fn browse_keys_are_ignored_while_composing() {
+        let mut app = loaded_app();
+        app.dispatch(Action::PrevPane);
+        assert_eq!(app.pr_index, 1);
+        app.dispatch(Action::Comment);
+        assert_eq!(app.dispatch(Action::Up), vec![]);
+        assert_eq!(app.pr_index, 1);
+        assert_eq!(app.dispatch(Action::Refresh), vec![]);
+    }
+
+    #[test]
+    fn quit_works_in_every_mode() {
+        let mut app = loaded_app();
+        app.dispatch(Action::Comment);
+        app.dispatch(Action::Quit);
+        assert!(app.should_quit);
     }
 }
