@@ -29,6 +29,18 @@ fn serve(
                 number,
                 result: source.changed_files(number).map_err(describe),
             },
+            Request::LoadConversation { number } => Response::Conversation {
+                number,
+                result: source.conversation(number).map_err(describe),
+            },
+            Request::PostComment { number, body } => Response::CommentPosted {
+                number,
+                result: source.post_comment(number, &body).map_err(describe),
+            },
+            Request::SubmitReview { number, review } => Response::ReviewSubmitted {
+                number,
+                result: source.submit_review(number, &review).map_err(describe),
+            },
         };
         if responses.send(response).is_err() {
             break;
@@ -43,17 +55,25 @@ fn describe(error: anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use anyhow::bail;
 
     use crate::github::{
         ChangedFile, ChecksState, Conversation, FileStatus, PullRequest, ReviewDecision,
-        ReviewSubmission,
+        ReviewEvent, ReviewSubmission,
     };
 
     struct FakeSource {
         fail: bool,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeSource {
+        fn new(fail: bool) -> FakeSource {
+            FakeSource { fail, calls: Arc::new(Mutex::new(Vec::new())) }
+        }
     }
 
     impl PullRequestSource for FakeSource {
@@ -86,15 +106,17 @@ mod tests {
         }
 
         fn conversation(&self, _number: u64) -> anyhow::Result<Conversation> {
-            unimplemented!()
+            Ok(Conversation::default())
         }
 
-        fn post_comment(&self, _number: u64, _body: &str) -> anyhow::Result<()> {
-            unimplemented!()
+        fn post_comment(&self, number: u64, body: &str) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!("post_comment {number} {body}"));
+            Ok(())
         }
 
-        fn submit_review(&self, _number: u64, _review: &ReviewSubmission) -> anyhow::Result<()> {
-            unimplemented!()
+        fn submit_review(&self, number: u64, review: &ReviewSubmission) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!("submit_review {number} {:?}", review.event));
+            Ok(())
         }
     }
 
@@ -102,7 +124,7 @@ mod tests {
 
     #[test]
     fn serves_pull_request_requests() {
-        let (requests, responses) = spawn(Arc::new(FakeSource { fail: false }));
+        let (requests, responses) = spawn(Arc::new(FakeSource::new(false)));
         requests.send(Request::LoadPullRequests).unwrap();
         match responses.recv_timeout(WAIT).unwrap() {
             Response::PullRequests(Ok(prs)) => assert_eq!(prs.len(), 1),
@@ -112,7 +134,7 @@ mod tests {
 
     #[test]
     fn serves_file_requests_with_number() {
-        let (requests, responses) = spawn(Arc::new(FakeSource { fail: false }));
+        let (requests, responses) = spawn(Arc::new(FakeSource::new(false)));
         requests.send(Request::LoadFiles { number: 7 }).unwrap();
         match responses.recv_timeout(WAIT).unwrap() {
             Response::Files { number: 7, result: Ok(files) } => assert_eq!(files[0].filename, "f7.rs"),
@@ -122,11 +144,45 @@ mod tests {
 
     #[test]
     fn reports_errors_as_strings() {
-        let (requests, responses) = spawn(Arc::new(FakeSource { fail: true }));
+        let (requests, responses) = spawn(Arc::new(FakeSource::new(true)));
         requests.send(Request::LoadPullRequests).unwrap();
         match responses.recv_timeout(WAIT).unwrap() {
             Response::PullRequests(Err(message)) => assert!(message.contains("boom"), "{message}"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn serves_conversation_requests() {
+        let (requests, responses) = spawn(Arc::new(FakeSource::new(false)));
+        requests.send(Request::LoadConversation { number: 7 }).unwrap();
+        match responses.recv_timeout(WAIT).unwrap() {
+            Response::Conversation { number: 7, result: Ok(_) } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serves_comment_and_review_requests() {
+        let source = FakeSource::new(false);
+        let calls = Arc::clone(&source.calls);
+        let (requests, responses) = spawn(Arc::new(source));
+        requests.send(Request::PostComment { number: 7, body: "hi".into() }).unwrap();
+        let review = ReviewSubmission {
+            event: ReviewEvent::Approve,
+            body: String::new(),
+            commit_sha: "s".into(),
+            comments: vec![],
+        };
+        requests.send(Request::SubmitReview { number: 7, review }).unwrap();
+        assert!(matches!(
+            responses.recv_timeout(WAIT).unwrap(),
+            Response::CommentPosted { number: 7, result: Ok(()) }
+        ));
+        assert!(matches!(
+            responses.recv_timeout(WAIT).unwrap(),
+            Response::ReviewSubmitted { number: 7, result: Ok(()) }
+        ));
+        assert_eq!(*calls.lock().unwrap(), ["post_comment 7 hi", "submit_review 7 Approve"]);
     }
 }

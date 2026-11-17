@@ -3,7 +3,7 @@
 //! [`Request`]s into [`Response`]s, and the UI draws whatever is here.
 
 use crate::diff::{DiffLine, parse_patch};
-use crate::github::{ChangedFile, PullRequest};
+use crate::github::{ChangedFile, Conversation, PullRequest, ReviewSubmission};
 use crate::repo::RepoSlug;
 
 /// Which pane receives navigation keys.
@@ -53,6 +53,9 @@ pub enum Action {
 pub enum Request {
     LoadPullRequests,
     LoadFiles { number: u64 },
+    LoadConversation { number: u64 },
+    PostComment { number: u64, body: String },
+    SubmitReview { number: u64, review: ReviewSubmission },
 }
 
 /// What the background worker sends back.
@@ -62,6 +65,18 @@ pub enum Response {
     Files {
         number: u64,
         result: Result<Vec<ChangedFile>, String>,
+    },
+    Conversation {
+        number: u64,
+        result: Result<Conversation, String>,
+    },
+    CommentPosted {
+        number: u64,
+        result: Result<(), String>,
+    },
+    ReviewSubmitted {
+        number: u64,
+        result: Result<(), String>,
     },
 }
 
@@ -202,7 +217,10 @@ impl App {
                     Err(message) => self.status = Status::Error(message),
                 }
             }
-            Response::Files { .. } => {}
+            Response::Files { .. }
+            | Response::Conversation { .. }
+            | Response::CommentPosted { .. }
+            | Response::ReviewSubmitted { .. } => {}
         }
     }
 

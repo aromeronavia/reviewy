@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::{
     ChangedFile, ChecksState, Comment, Conversation, DiffSide, FileStatus, PullRequest,
-    PullRequestSource, ReviewDecision, ReviewState, ReviewSubmission, Thread,
+    PullRequestSource, ReviewDecision, ReviewEvent, ReviewState, ReviewSubmission, Thread,
 };
 use crate::repo::RepoSlug;
 
@@ -96,6 +96,27 @@ impl HttpGitHub {
         }
         let parsed: GraphqlResponse<T> = response.json().context("unexpected response body")?;
         parsed.into_data()
+    }
+
+    /// Posts a JSON payload to a REST endpoint; GitHub's `message` on failure
+    /// is appended to the short status description.
+    fn post(&self, path: &str, payload: &Value) -> Result<()> {
+        let response = self
+            .client
+            .post(format!("{}{path}", self.base_url))
+            .json(payload)
+            .send()
+            .map_err(network_error)?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let detail = response
+            .json::<Value>()
+            .ok()
+            .and_then(|body| body["message"].as_str().map(|m| format!(": {m}")))
+            .unwrap_or_default();
+        bail!("{}{detail}", describe_status(status))
     }
 
     /// Fetches every page of a REST list endpoint, stopping at the first
@@ -208,13 +229,62 @@ impl PullRequestSource for HttpGitHub {
         Ok(conversation_from_wire(wire))
     }
 
-    fn post_comment(&self, _number: u64, _body: &str) -> Result<()> {
-        todo!("Task 3")
+    fn post_comment(&self, number: u64, body: &str) -> Result<()> {
+        let path = format!(
+            "/repos/{}/{}/issues/{number}/comments",
+            self.repo.owner, self.repo.name
+        );
+        self.post(&path, &comment_payload(body))
+            .with_context(|| format!("comment on #{number}"))
     }
 
-    fn submit_review(&self, _number: u64, _review: &ReviewSubmission) -> Result<()> {
-        todo!("Task 3")
+    fn submit_review(&self, number: u64, review: &ReviewSubmission) -> Result<()> {
+        let path = format!(
+            "/repos/{}/{}/pulls/{number}/reviews",
+            self.repo.owner, self.repo.name
+        );
+        self.post(&path, &review_payload(review))
+            .with_context(|| format!("review for #{number}"))
     }
+}
+
+// ---- REST writes ------------------------------------------------------------
+
+fn comment_payload(body: &str) -> Value {
+    json!({ "body": body })
+}
+
+/// The body for `POST pulls/{n}/reviews`. `body` and `comments` are left out
+/// when empty: GitHub rejects an empty `comments` array on an approval.
+fn review_payload(review: &ReviewSubmission) -> Value {
+    let event = match review.event {
+        ReviewEvent::Approve => "APPROVE",
+        ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+        ReviewEvent::Comment => "COMMENT",
+    };
+    let mut payload = json!({ "event": event, "commit_id": review.commit_sha });
+    if !review.body.is_empty() {
+        payload["body"] = Value::String(review.body.clone());
+    }
+    if !review.comments.is_empty() {
+        payload["comments"] = review
+            .comments
+            .iter()
+            .map(|comment| {
+                let side = match comment.side {
+                    DiffSide::Left => "LEFT",
+                    DiffSide::Right => "RIGHT",
+                };
+                json!({
+                    "path": comment.path,
+                    "line": comment.line,
+                    "side": side,
+                    "body": comment.body,
+                })
+            })
+            .collect();
+    }
+    payload
 }
 
 // ---- GraphQL envelope -------------------------------------------------------
@@ -503,7 +573,9 @@ impl From<WireFile> for ChangedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::FileStatus;
+    use std::time::Duration;
+
+    use crate::github::{FileStatus, NewLineComment, ReviewEvent};
 
     #[test]
     fn builds_paged_urls() {
@@ -608,5 +680,104 @@ mod tests {
         let conversation = HttpGitHub::new(repo, token).unwrap().conversation(2266).unwrap();
         assert!(!conversation.threads.is_empty());
         assert!(!conversation.body.is_empty());
+    }
+
+    #[test]
+    fn review_payload_omits_empty_body_and_comments() {
+        let review = ReviewSubmission {
+            event: ReviewEvent::Approve,
+            body: "".into(),
+            commit_sha: "abc".into(),
+            comments: vec![],
+        };
+        assert_eq!(review_payload(&review), json!({"event": "APPROVE", "commit_id": "abc"}));
+    }
+
+    #[test]
+    fn review_payload_includes_line_comments() {
+        let review = ReviewSubmission {
+            event: ReviewEvent::RequestChanges,
+            body: "fix".into(),
+            commit_sha: "abc".into(),
+            comments: vec![NewLineComment {
+                path: "src/a.rs".into(),
+                line: 7,
+                side: DiffSide::Left,
+                body: "why".into(),
+            }],
+        };
+        let payload = review_payload(&review);
+        assert_eq!(payload["event"], "REQUEST_CHANGES");
+        assert_eq!(payload["body"], "fix");
+        assert_eq!(payload["comments"][0]["path"], "src/a.rs");
+        assert_eq!(payload["comments"][0]["line"], 7);
+        assert_eq!(payload["comments"][0]["side"], "LEFT");
+        assert_eq!(payload["comments"][0]["body"], "why");
+    }
+
+    #[test]
+    fn posts_comment_to_issues_endpoint() {
+        let (addr, received) = stub_server();
+        let client = HttpGitHub::new(RepoSlug::parse("o/n").unwrap(), "t".into())
+            .unwrap()
+            .with_base_url(format!("http://{addr}"));
+        client.post_comment(5, "hi").unwrap();
+        let request = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request.starts_with("POST /repos/o/n/issues/5/comments "), "{request}");
+        assert!(request.contains(r#"{"body":"hi"}"#), "{request}");
+    }
+
+    #[test]
+    fn posts_review_to_reviews_endpoint() {
+        let (addr, received) = stub_server();
+        let client = HttpGitHub::new(RepoSlug::parse("o/n").unwrap(), "t".into())
+            .unwrap()
+            .with_base_url(format!("http://{addr}"));
+        let review = ReviewSubmission {
+            event: ReviewEvent::RequestChanges,
+            body: "fix".into(),
+            commit_sha: "abc".into(),
+            comments: vec![],
+        };
+        client.submit_review(5, &review).unwrap();
+        let request = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request.starts_with("POST /repos/o/n/pulls/5/reviews "), "{request}");
+        assert!(request.contains("REQUEST_CHANGES"), "{request}");
+    }
+
+    /// Accepts one HTTP request, answers 201, and hands the raw request back.
+    fn stub_server() -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+            tx.send(String::from_utf8_lossy(&buf).into_owned()).unwrap();
+        });
+        (addr, rx)
     }
 }
