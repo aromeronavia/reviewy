@@ -23,10 +23,11 @@ use repo::RepoSlug;
 
 const USAGE: &str = "usage: reviewy [owner/name]
 
-Browse a repository's open pull requests and their diffs in the terminal.
+Browse and review a repository's open pull requests in the terminal.
 Without an argument the repository is read from the current directory's
 `origin` remote. The GitHub token comes from GITHUB_TOKEN, GH_TOKEN, or
-`gh auth token`, in that order.";
+`gh auth token`, in that order. Set GITHUB_API_URL to point at a GitHub
+Enterprise server (default https://api.github.com).";
 
 /// How long one loop iteration waits for a key before checking the worker.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -54,7 +55,11 @@ fn start(repo_arg: Option<&str>) -> Result<()> {
         None => RepoSlug::detect_from_git()?,
     };
     let token = auth::resolve_token()?;
-    let source = Arc::new(HttpGitHub::new(repo.clone(), token)?);
+    let mut source = HttpGitHub::new(repo.clone(), token)?;
+    if let Ok(base_url) = env::var("GITHUB_API_URL") {
+        source = source.with_base_url(base_url.trim_end_matches('/').to_string());
+    }
+    let source = Arc::new(source);
     let (requests, responses) = worker::spawn(source);
     let mut app = App::new(repo);
     for request in app.dispatch(Action::Refresh) {
